@@ -27,6 +27,7 @@ We follow this einsum axis naming convention:
 
 from collections.abc import Sequence
 import dataclasses
+import os
 from typing import Literal, TypeAlias
 
 import einops
@@ -39,6 +40,36 @@ import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
 
 PALIGEMMA_VOCAB_SIZE = 257_152
+
+# Global variable to track the log file path
+_attention_log_file = None
+
+
+def set_attention_log_file(filepath: str | None = "kv_rank.txt"):
+    """Set the file path for logging attention indices.
+    
+    Args:
+        filepath: Path to the log file. If None, logging is disabled.
+    """
+    global _attention_log_file
+    _attention_log_file = filepath
+    # Create/truncate the file if it exists
+    if filepath is not None:
+        with open(filepath, 'w') as f:
+            f.write('')  # Clear the file
+
+
+def _log_indices_to_file(indices):
+    """Callback function to log attention indices to file."""
+    if _attention_log_file is None:
+        return
+    
+    # Convert JAX array to Python list
+    indices_list = indices.tolist() if hasattr(indices, 'tolist') else list(indices)
+    
+    # Write to file (append mode)
+    with open(_attention_log_file, 'a') as f:
+        f.write(','.join(map(str, indices_list)) + '\n')
 
 
 @dataclasses.dataclass
@@ -226,6 +257,30 @@ class Attention(nn.Module):
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+
+        # Record top-50 attention positions to static KV cache (prefix tokens: images + text)
+        # This records action_expert_token's attention to static prefix tokens
+        if kv_cache is not None:
+            cache_k, cache_v = kv_cache
+            prefix_len = cache_k.shape[1]  # Length of static prefix (images + text)
+            
+            # Only record if we have action_expert (typically the second expert, index=1)
+            # and it's not None (i.e., we're processing suffix tokens)
+            if len(xs) > 1 and xs[1] is not None:
+                # probs shape: BKGTS, where S = prefix_len + suffix_len
+                # Average over heads (K and G dimensions) to get BTS
+                avg_attn_score = jnp.mean(probs, axis=(1, 2))  # Shape: BTS
+                
+                # Get attention of the last action token (last query position)
+                # Only look at attention to static prefix tokens (first prefix_len positions)
+                current_token_attn_to_prefix = avg_attn_score[:, -1, :prefix_len]  # Shape: B prefix_len
+                
+                # Get top-k attention positions within the static prefix
+                top_k = min(50, prefix_len)  # Top-50 or all if prefix is shorter
+                top_vals, top_indices = jax.lax.top_k(current_token_attn_to_prefix[0], k=top_k)
+                
+                # Record top-50 attention positions to file using jax.debug.callback
+                jax.debug.callback(_log_indices_to_file, top_indices)
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")

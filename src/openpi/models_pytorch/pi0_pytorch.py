@@ -375,6 +375,7 @@ class PI0Pytorch(nn.Module):
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        print(">>> [PI0 DEBUG] 正在执行 sample_actions 推理 <<<")
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
@@ -416,6 +417,14 @@ class PI0Pytorch(nn.Module):
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
+            diffusion_trace.append(x_t.mean().item())
+        print("="*60)
+        print(">>> [VLA INTERNAL DEBUG TRACE] <<<")
+        print(f"Num Steps: {num_steps}")
+        # 打印扩散轨迹的前几步和后几步
+        print(f"Diffusion Trace (First 5 steps): {diffusion_trace[:5]}")
+        print(f"Diffusion Trace (Last 5 steps): {diffusion_trace[-5:]}")
+        print("="*60)
         return x_t
 
     def denoise_step(

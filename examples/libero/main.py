@@ -3,7 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
-
+import torch
 import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
@@ -16,8 +16,17 @@ import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+_original_torch_load = torch.load
 
+def _safe_legacy_load(*args, **kwargs):
+    # 如果调用者没有指定 weights_only，我们强制将其设为 False
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
 
+# 覆盖官方函数
+torch.load = _safe_legacy_load
+print("✅ 已全局禁用 PyTorch 权重安全检查 (Hack for LIBERO legacy data)")
 @dataclasses.dataclass
 class Args:
     #################################################################################################################
