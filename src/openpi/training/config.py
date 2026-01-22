@@ -619,7 +619,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_droid",
-        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        model=pi0_config.Pi0Config(action_horizon=200, pi05=True),
         data=SimpleDataConfig(
             assets=AssetsConfig(asset_id="droid"),
             data_transforms=lambda model: _transforms.Group(
@@ -630,7 +630,7 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
-    ),
+    ),#这里构建起了我们所有的参数
     #
     # Fine-tuning Libero configs.
     #
@@ -979,3 +979,6 @@ def get_config(config_name: str) -> TrainConfig:
         raise ValueError(f"Config '{config_name}' not found.{closest_str}")
 
     return _CONFIGS_DICT[config_name]
+#先把 _CONFIGS 列表中所有 config.name 收集成集合，检查是否有重复；一旦发现重名就抛错
+#把列表 转成字典，键是 name，值是对应的 TrainConfig 对象
+#之后 get_config(name) 就能 O(1) 通过名字拿到那条配置

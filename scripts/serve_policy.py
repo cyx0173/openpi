@@ -79,25 +79,42 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
+        print(f"【Checkpoint Dir】: {checkpoint.dir}")  # <--- 这里就是你要确认的路径！
+        print(f"【checkpoint.config】: {checkpoint.config}")
+        print("="*52 + "\n")
         return _policy_config.create_trained_policy(
             _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
         )
     raise ValueError(f"Unsupported environment mode: {env}")
-
+#【Checkpoint Dir】: gs://openpi-assets/checkpoints/pi05_droid
+#【checkpoint.config】: pi05_droid
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            # 1. 先把配置对象取出来
+            config_data = _config.get_config(args.policy.config)
+            
+            # 2. 打印你想要看的所有信息
+            print("\n" + "="*20 + " DEBUG INFO " + "="*20)
+            print(f"【Config Name】: {args.policy.config}")
+            print(f"【Checkpoint Dir】: {args.policy.dir}")  # <--- 这里就是你要确认的路径！
+            print(f"【Default Prompt】: {args.default_prompt}")
+            print(f"【Config Object】: {config_data}")      # 这会打印出具体的 Pi0Config 配置详情
+            print("="*52 + "\n")
+
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
-            )
+            )#get_config(DROID)
+
         case Default():
+            print("="*52 + "\n")
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 
 def main(args: Args) -> None:
-    policy = create_policy(args)
+    policy = create_policy(args)#创建对应的policy
     policy_metadata = policy.metadata
     set_attention_log_file()
     # Record the policy's behavior.

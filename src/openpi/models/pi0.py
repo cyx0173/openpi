@@ -6,7 +6,7 @@ import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
 from typing_extensions import override
-
+import nvtx
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
@@ -238,33 +238,29 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
-            )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
+            with nvtx.annotate("pi0_embed_suffix", domain="pi0"):
+                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                    observation, x_t, jnp.broadcast_to(time, batch_size)
+                )
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+
+            
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
-            )
+            with nvtx.annotate("pi0_pali_llm_kvcache", domain="pi0"):
+                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens],
+                    mask=full_attn_mask,
+                    positions=positions,
+                    kv_cache=kv_cache,
+                    adarms_cond=[None, adarms_cond],
+                )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 

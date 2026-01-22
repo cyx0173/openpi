@@ -14,7 +14,7 @@ import openpi.transforms as transforms
 
 
 def create_trained_policy(
-    train_config: _config.TrainConfig,
+    train_config: _config.TrainConfig, #从前面的config.py中拿到的训练配置
     checkpoint_dir: pathlib.Path | str,
     *,
     repack_transforms: transforms.Group | None = None,
@@ -44,18 +44,24 @@ def create_trained_policy(
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
-
+    print(f"Loading checkpoint from {checkpoint_dir}...")
+    #这里的 checkpoint_dir 是前面配置好的路径 "gs://openpi-assets/checkpoints/pi05_droid"
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
-
+    print(f"Is_pytoch", is_pytorch)
+    #OpenPI 的权重命名约定
+    #PyTorch：使用 model.safetensors
+    #Flax/JAX：使用目录 params/ 保存分片权重
     logging.info("Loading model...")
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        #用 Flax 权重文件反序列化并构建模型,用读出来的参数，构建出 JAX 的模型结构
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    #：创建数据处理的配置对象,它决定了图片要怎么裁剪、分辨率要是多少，是根据模型的需求动态生成的。
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.

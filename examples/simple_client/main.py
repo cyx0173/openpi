@@ -21,7 +21,7 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
-
+#基本的环境和平台
 
 @dataclasses.dataclass
 class Args:
@@ -121,7 +121,7 @@ def main(args: Args) -> None:
         EnvMode.DROID: _random_observation_droid,
         EnvMode.LIBERO: _random_observation_libero,
     }[args.env]
-
+#参数传入 选择env
     policy = _websocket_client_policy.WebsocketClientPolicy(
         host=args.host,
         port=args.port,
