@@ -9,7 +9,7 @@ from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
-
+import jax.profiler
 
 class EnvMode(enum.Enum):
     """Supported environments."""
@@ -97,12 +97,12 @@ def create_policy(args: Args) -> _policy.Policy:
             config_data = _config.get_config(args.policy.config)
             
             # 2. 打印你想要看的所有信息
-            print("\n" + "="*20 + " DEBUG INFO " + "="*20)
-            print(f"【Config Name】: {args.policy.config}")
-            print(f"【Checkpoint Dir】: {args.policy.dir}")  # <--- 这里就是你要确认的路径！
-            print(f"【Default Prompt】: {args.default_prompt}")
-            print(f"【Config Object】: {config_data}")      # 这会打印出具体的 Pi0Config 配置详情
-            print("="*52 + "\n")
+            #print("\n" + "="*20 + " DEBUG INFO " + "="*20)
+            #print(f"【Config Name】: {args.policy.config}")
+            #print(f"【Checkpoint Dir】: {args.policy.dir}")  # <--- 这里就是你要确认的路径！
+            #print(f"【Default Prompt】: {args.default_prompt}")
+            #print(f"【Config Object】: {config_data}")      # 这会打印出具体的 Pi0Config 配置详情
+            #print("="*52 + "\n")
 
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
@@ -124,13 +124,12 @@ def main(args: Args) -> None:
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
-
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
         host="0.0.0.0",
         port=args.port,
         metadata=policy_metadata,
-    )
+    )#实例化的是WebsocketPolicyServer类 然后下面调用对应的serve_forever方法
     server.serve_forever()
 
 

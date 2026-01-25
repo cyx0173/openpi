@@ -69,7 +69,7 @@ class Policy(BasePolicy):
         # Make a copy since transformations may modify the inputs in place.
         #print("policy.model.action_horizon:", self._model.action_horizon)
         #print("policy.model.action_dim:", self._model.action_dim)
-        
+        my_t0 = time.time()
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
@@ -92,20 +92,24 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        #为了传出准确的时间
+        print("model.sample_actions start time:", (time.time()-my_t0)*1000)
+        actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        print("model.sample_actions middle time:", (time.time()-my_t0)*1000)
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
-
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        print("model.sample_actions end time:", (time.time()-my_t0)*1000)
         return outputs
 
     @property

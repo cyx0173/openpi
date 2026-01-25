@@ -1,11 +1,11 @@
 import logging
 import math
-
+import time
 import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
-
+from typing import Generator
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
@@ -375,7 +375,8 @@ class PI0Pytorch(nn.Module):
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        print(">>> [PI0 DEBUG] 正在执行 sample_actions 推理 <<<")
+        #print(">>> [PI0 DEBUG] 正在执行 sample_actions 推理 <<<")
+        handle_obs_start_time = time.monotonic()
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
@@ -398,14 +399,14 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
-
+        handle_obs_time = time.monotonic()-handle_obs_start_time
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+        time2 = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while time2 >= -dt / 2:
+            expanded_time = time2.expand(bsize)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -416,16 +417,18 @@ class PI0Pytorch(nn.Module):
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
-            time += dt
-            diffusion_trace.append(x_t.mean().item())
-        print("="*60)
-        print(">>> [VLA INTERNAL DEBUG TRACE] <<<")
-        print(f"Num Steps: {num_steps}")
+            time2 += dt
+            #diffusion_trace.append(x_t.mean().item())
+        #print("="*60)
+        #print(">>> [VLA INTERNAL DEBUG TRACE] <<<")
+        #print(f"Num Steps: {num_steps}")
         # 打印扩散轨迹的前几步和后几步
-        print(f"Diffusion Trace (First 5 steps): {diffusion_trace[:5]}")
-        print(f"Diffusion Trace (Last 5 steps): {diffusion_trace[-5:]}")
-        print("="*60)
+        #print(f"Diffusion Trace (First 5 steps): {diffusion_trace[:5]}")
+        #print(f"Diffusion Trace (Last 5 steps): {diffusion_trace[-5:]}")
+        #print("="*60)
+        total_time = time.monotonic()-handle_obs_start_time
         return x_t
+
 
     def denoise_step(
         self,

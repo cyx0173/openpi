@@ -12,7 +12,8 @@ from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
-
+import time
+from jax import named_call
 logger = logging.getLogger("openpi")
 
 
@@ -219,48 +220,86 @@ class Pi0(_model.BaseModel):
         rng: at.KeyArrayLike,
         observation: _model.Observation,
         *,
-        num_steps: int | at.Int[at.Array, ""] = 10,
+        num_steps: int | at.Int[at.Array, ""] = 1,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        import time
+        import jax
+        import jax.numpy as jnp
+
         observation = _model.preprocess_observation(None, observation, train=False)
-        # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
-        # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+        
+        # 确保 noise 已经被生成，用于作为第一个触发器的依赖
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # first fill KV cache with a forward pass of the prefix
+        # --- [Insert Start]: 定义三段式计时系统 ---
+        # 状态容器：[T0_start, T1_middle]
+        _timer_state = [] 
+
+        def _cb_T0_start(_):
+            _timer_state.append(time.perf_counter())
+
+        def _cb_T1_middle(_):
+            _timer_state.append(time.perf_counter())
+
+        def _cb_T2_end_and_print(_):
+            if len(_timer_state) >= 2:
+                t_end = time.perf_counter()
+                t_middle = _timer_state.pop()
+                t_start = _timer_state.pop()
+                
+                # 计算各阶段耗时
+                cost_prefix = (t_middle - t_start) * 1000
+                cost_diff = (t_end - t_middle) * 1000
+                cost_total = (t_end - t_start) * 1000
+                
+                print(f" >> [Time] Prefix: {cost_prefix:.2f}ms | Diffusion: {cost_diff:.2f}ms | Total: {cost_total:.2f}ms")
+            else:
+                # 容错：防止状态错乱
+                _timer_state.clear()
+        # --- [Insert End] ---
+
+        # === 探针 1: 开始计时 ===
+        # 使用 noise 的第一个元素触发，代表 GPU 开始处理数据
+        trigger_0 = jax.lax.stop_gradient(noise[0, 0, 0]).astype(jnp.float32)
+        jax.debug.callback(_cb_T0_start, trigger_0)
+
+        # === 第一部分: Prefix Phase ===
+        # with nvtx.annotate("1.Prefix_Phase", color="green"): # 保留你的原有标记
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions) 
+        
+        # === 探针 2: 中间计时 (Prefix结束/Diffusion开始) ===
+        # 使用 kv_cache 触发，迫使 Host 等待 Prefix 完成
+        trigger_1 = jax.lax.stop_gradient(kv_cache[0][0, 0, 0]).astype(jnp.float32)
+        jax.debug.callback(_cb_T1_middle, trigger_1)
 
         def step(carry):
             x_t, time = carry
-            with nvtx.annotate("pi0_embed_suffix", domain="pi0"):
-                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                    observation, x_t, jnp.broadcast_to(time, batch_size)
-                )
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-
-            
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-            with nvtx.annotate("pi0_pali_llm_kvcache", domain="pi0"):
-                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                    [None, suffix_tokens],
-                    mask=full_attn_mask,
-                    positions=positions,
-                    kv_cache=kv_cache,
-                    adarms_cond=[None, adarms_cond],
-                )
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
@@ -268,8 +307,15 @@ class Pi0(_model.BaseModel):
 
         def cond(carry):
             x_t, time = carry
-            # robust to floating-point error
             return time >= -dt / 2
-
+        
+        # === 第二部分: Diffusion Loop ===
+        # with nvtx.annotate("2.Diffusion_Loop", color="yellow"):
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        
+        # === 探针 3: 结束计时并打印 ===
+        # 使用 x_0 触发，迫使 Host 等待 Loop 完成
+        trigger_end = jax.lax.stop_gradient(x_0[0, 0, 0]).astype(jnp.float32)
+        jax.debug.callback(_cb_T2_end_and_print, trigger_end)
+
         return x_0

@@ -619,7 +619,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_droid",
-        model=pi0_config.Pi0Config(action_horizon=200, pi05=True),
+        model=pi0_config.Pi0Config(action_horizon=10, pi05=True),
         data=SimpleDataConfig(
             assets=AssetsConfig(asset_id="droid"),
             data_transforms=lambda model: _transforms.Group(
