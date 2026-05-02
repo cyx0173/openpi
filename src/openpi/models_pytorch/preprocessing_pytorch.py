@@ -37,13 +37,29 @@ def preprocess_observation_pytorch(
     for key in image_keys:
         image = observation.images[key]
 
-        # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
+        # Guard: densify sparse COO tensors before any processing
+        if image.is_sparse:
+            image = image.to_dense()
+
+        # Guard: ensure 4D tensor [B, H, W, C] or [B, C, H, W]
+        if image.ndim == 3:
+            if image.shape[0] == 3:  # [C, H, W] -> [1, C, H, W]
+                image = image.unsqueeze(0)
+            elif image.shape[2] == 3:  # [H, W, C] -> [1, H, W, C]
+                image = image.unsqueeze(0)
+            else:  # [H, W] or unusual: treat as grayscale
+                image = image.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        elif image.ndim == 2:
+            image = image.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+
         # Handle both [B, C, H, W] and [B, H, W, C] formats
-        is_channels_first = image.shape[1] == 3  # Check if channels are in dimension 1
+        is_channels_first = image.ndim == 4 and image.shape[1] == 3
 
         if is_channels_first:
             # Convert [B, C, H, W] to [B, H, W, C] for processing
             image = image.permute(0, 2, 3, 1)
+        elif image.ndim != 4:
+            raise ValueError(f"Image {key} has unexpected shape {image.shape} after normalization, expected 4D")
 
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")

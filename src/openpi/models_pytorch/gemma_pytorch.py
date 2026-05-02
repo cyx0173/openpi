@@ -96,6 +96,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        output_hidden_states: bool = False,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -111,6 +112,10 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
+            extra_output = {"prefix_hidden_states": None, "suffix_hidden_states": None}
+            if output_hidden_states:
+                return [prefix_output, suffix_output], prefix_past_key_values, extra_output
+            return [prefix_output, suffix_output], prefix_past_key_values
         elif inputs_embeds[0] is None:
             suffix_output = self.gemma_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
@@ -123,6 +128,10 @@ class PaliGemmaWithExpertModel(nn.Module):
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
+            extra_output = {"prefix_hidden_states": None, "suffix_hidden_states": None}
+            if output_hidden_states:
+                return [prefix_output, suffix_output], prefix_past_key_values, extra_output
+            return [prefix_output, suffix_output], prefix_past_key_values
         else:
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
@@ -237,6 +246,10 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                 return outputs_embeds
 
+            # Collect intermediate hidden states for all layers if requested
+            all_prefix_hidden_states = [] if output_hidden_states else None
+            all_suffix_hidden_states = [] if output_hidden_states else None
+
             # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):
                 if use_gradient_checkpointing:
@@ -255,7 +268,13 @@ class PaliGemmaWithExpertModel(nn.Module):
                         layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
                     )
 
-                # Old code removed - now using compute_layer_complete function above
+                if output_hidden_states:
+                    # Store hidden state after this layer's residual connection (pre-norm)
+                    # inputs_embeds is a list: [prefix_hidden, suffix_hidden]
+                    if inputs_embeds[0] is not None:
+                        all_prefix_hidden_states.append(inputs_embeds[0])
+                    if inputs_embeds[1] is not None:
+                        all_suffix_hidden_states.append(inputs_embeds[1])
 
             # final norm
             # Define final norm computation function for gradient checkpointing
@@ -277,5 +296,11 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = outputs_embeds[0]
             suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
+            extra_output = {
+                "prefix_hidden_states": all_prefix_hidden_states,
+                "suffix_hidden_states": all_suffix_hidden_states,
+            }
 
+        if output_hidden_states:
+            return [prefix_output, suffix_output], prefix_past_key_values, extra_output
         return [prefix_output, suffix_output], prefix_past_key_values

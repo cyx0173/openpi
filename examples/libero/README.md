@@ -52,6 +52,7 @@ python examples/libero/main.py
 
 # To run with glx for Mujoco instead (use this if you have egl errors):
 MUJOCO_GL=glx python examples/libero/main.py
+MUJOCO_EGL_DEVICE_ID=8 uv run python examples/libero/main.py
 ```
 
 Terminal window 2:

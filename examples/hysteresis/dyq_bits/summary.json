@@ -1,0 +1,33 @@
+{
+  "num_episodes": 10,
+  "num_successful": 10,
+  "total_steps": 2602,
+  "mean_steps_per_episode": 260.2,
+  "thresholds": {
+    "theta_fp": 0.5797088888340615,
+    "theta_4_8": 0.4544485178743066,
+    "theta_2_4": 0.3329188870870639
+  },
+  "params": {
+    "w_macro": 10,
+    "w_micro": 3,
+    "lambda_param": 0.5,
+    "K": 5
+  },
+  "mean_bits": 9.311559800689999,
+  "std_bits": 0.8013243372775691,
+  "mean_sensitivity": 0.4080881272343828,
+  "std_sensitivity": 0.026802282708629107,
+  "mean_upgrades": 12.1,
+  "mean_downgrades": 11.5,
+  "bit_fraction_overall": {
+    "2": 0.05111452728670254,
+    "4": 0.191391237509608,
+    "8": 0.4607993850883935,
+    "16": 0.29669485011529595
+  },
+  "mean_fraction_fp": 0.29960497199054376,
+  "mean_fraction_8bit": 0.45536912237454946,
+  "mean_fraction_4bit": 0.19243772928754485,
+  "mean_fraction_2bit": 0.052588176347361903
+}

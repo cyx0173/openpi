@@ -109,7 +109,7 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        #self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -371,19 +371,27 @@ class PI0Pytorch(nn.Module):
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
-
+    def calculate_erank(self, matrix: torch.Tensor):
+        """计算特征矩阵的有效秩 (eRank)"""
+        matrix = matrix.float()
+        # 使用 svdvals 仅计算奇异值，速度最快
+        s = torch.linalg.svdvals(matrix)
+        s_sum = torch.sum(s) + 1e-10
+        p = s / s_sum
+        entropy = -torch.sum(p * torch.log(p + 1e-10))
+        return torch.exp(entropy).item()
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        #print(">>> [PI0 DEBUG] 正在执行 sample_actions 推理 <<<")
-        handle_obs_start_time = time.monotonic()
+     
+        device = torch.device(device)
+  
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -391,15 +399,27 @@ class PI0Pytorch(nn.Module):
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
+        _, past_key_values, hidden_states_output = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
+            output_hidden_states=True,
         )
-        handle_obs_time = time.monotonic()-handle_obs_start_time
+        if device.type == "cuda":
+           torch.cuda.synchronize()
+        #eRank logging (commented out)
+        #v_block1 = past_key_values[0][1]
+        #v_matrix = v_block1[0].transpose(0, 1).reshape(v_block1.shape[2], -1)
+        #current_erank = self.calculate_erank(v_matrix)
+        #handle_obs_time = time.monotonic()
+        #prefill_ms = (handle_obs_time - handle_start_time) * 1000
+        #logging.info(f"eRank: {current_erank:.4f}, Calc_Time: {prefill_ms:.2f} ms")
+      
+        # Extract prefix hidden states (22 layers) for Q-Selector
+        prefix_hidden_states = hidden_states_output["prefix_hidden_states"]
+
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
@@ -418,16 +438,14 @@ class PI0Pytorch(nn.Module):
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time2 += dt
-            #diffusion_trace.append(x_t.mean().item())
-        #print("="*60)
-        #print(">>> [VLA INTERNAL DEBUG TRACE] <<<")
-        #print(f"Num Steps: {num_steps}")
-        # 打印扩散轨迹的前几步和后几步
-        #print(f"Diffusion Trace (First 5 steps): {diffusion_trace[:5]}")
-        #print(f"Diffusion Trace (Last 5 steps): {diffusion_trace[-5:]}")
-        #print("="*60)
-        total_time = time.monotonic()-handle_obs_start_time
-        return x_t
+        
+        #if device.type == "cuda":
+            #torch.cuda.synchronize()
+        #handle_action = time.monotonic()
+        #denoise_ms = (handle_action - handle_obs_time) * 1000
+        #total_ms = (handle_action - handle_start_time) * 1000
+        #logging.info(f"[gen_action] {denoise_ms} ms ")
+        return x_t, prefix_hidden_states
 
 
     def denoise_step(

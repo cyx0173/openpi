@@ -1,5 +1,14 @@
 import collections
 import dataclasses
+import sys
+import os
+
+# Set MuJoCo EGL device before any rendering
+os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", "8")
+
+# Add third_party to Python path so libero can be imported
+# libero package lives at third_party/libero/libero/, so we add third_party (not third_party/libero)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../third_party/libero"))
 import logging
 import math
 import pathlib
@@ -17,16 +26,37 @@ import tyro
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 _original_torch_load = torch.load
-
 def _safe_legacy_load(*args, **kwargs):
     # 如果调用者没有指定 weights_only，我们强制将其设为 False
     if 'weights_only' not in kwargs:
         kwargs['weights_only'] = False
     return _original_torch_load(*args, **kwargs)
 
-# 覆盖官方函数
 torch.load = _safe_legacy_load
 print("✅ 已全局禁用 PyTorch 权重安全检查 (Hack for LIBERO legacy data)")
+
+# Monkey-patch: 修复 create_robot 对未知 robot name 的容错
+# LIBERO 的 OnTheGround/Mounted 前缀 robot 在新版本 robosuite 里可能不存在
+# 我们 patch create_robot 让它在失败时 fallback 到基础 Panda robot
+from robosuite.models.robots.robot_model import create_robot as _create_robot_orig
+
+_robot_model_module = None
+
+def _safe_create_robot(robot_name, *args, **kwargs):
+    try:
+        return _create_robot_orig(robot_name, *args, **kwargs)
+    except KeyError:
+        import robosuite.models.robots.panda_model as pm
+        return pm.Panda(idn=kwargs.get("idn", 0))
+
+import robosuite.models.robots.robot_model
+robosuite.models.robots.robot_model.create_robot = _safe_create_robot
+# Also patch the module-level reference
+import sys
+for mod_name, mod in list(sys.modules.items()):
+    if mod is not None and hasattr(mod, "create_robot"):
+        mod.create_robot = _safe_create_robot
+print("✅ 已 patch create_robot 兼容未知 robot 类型")
 @dataclasses.dataclass
 class Args:
     #################################################################################################################
@@ -41,10 +71,10 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_10"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
-    num_trials_per_task: int = 50  # Number of rollouts per task
+    num_trials_per_task: int = 1  # Number of rollouts per task
 
     #################################################################################################################
     # Utils

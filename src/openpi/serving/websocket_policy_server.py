@@ -49,6 +49,10 @@ class WebsocketPolicyServer:
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = msgpack_numpy.Packer()
 
+        # Reset RNG to fixed seed on each new client connection for reproducibility
+        if hasattr(self._policy, "reset_rng"):
+            self._policy.reset_rng(0)
+
         await websocket.send(packer.pack(self._metadata))
 
         prev_total_time = None

@@ -1,6 +1,7 @@
 import dataclasses
 import enum
 import logging
+import os
 import socket
 
 import tyro
@@ -54,6 +55,18 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # --- DyQVLA-style W4A4 Quantization (PyTorch models only) ---
+    # If True, apply fake quantization to all nn.Linear layers.
+    quantize: bool = False
+    # Bit-width for quantization. Options: 4, 8, 16 (16 = full precision bypass).
+    quantize_bits: int = 4
+    # Weight group size for per-group quantization. 256 is recommended (tested optimal).
+    quantize_group_size: int = 256
+    # Number of calibration steps (batches) to run before inference.
+    # Each step uses a real observation from the calibration data directory.
+    # 0 = no calibration (online scale estimation). Recommended: 32-128.
+    calibration_steps: int = 0
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -94,7 +107,7 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             # 1. 先把配置对象取出来
-            config_data = _config.get_config(args.policy.config)
+            #config_data = _config.get_config(args.policy.config)
             
             # 2. 打印你想要看的所有信息
             #print("\n" + "="*20 + " DEBUG INFO " + "="*20)
@@ -105,7 +118,13 @@ def create_policy(args: Args) -> _policy.Policy:
             #print("="*52 + "\n")
 
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                quantize=args.quantize,
+                quantize_bits=args.quantize_bits,
+                quantize_group_size=args.quantize_group_size,
+                calibration_steps=args.calibration_steps,
             )#get_config(DROID)
 
         case Default():
@@ -114,6 +133,7 @@ def create_policy(args: Args) -> _policy.Policy:
 
 
 def main(args: Args) -> None:
+    os.environ["OPENPI_DATA_HOME"] = "/share/chengyuxuan-local/openpi"
     policy = create_policy(args)#创建对应的policy
     policy_metadata = policy.metadata
     set_attention_log_file()
@@ -136,3 +156,28 @@ def main(args: Args) -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, force=True)
     main(tyro.cli(Args))
+"""
+# FP16 baseline（和以前一样）
+python scripts/serve_policy.py \
+    --policy.checkpoint.config pi05_libero \
+    --policy.checkpoint.dir gs://path/to/checkpoint
+
+# W4A4 量化（你要跑的）
+python scripts/serve_policy.py --env LIBERO --port 8000 --quantize --quantize-bits 4  --calibration-steps 64   
+    
+# W8A8（备选，更高精度）
+python scripts/serve_policy.py \
+    --policy.checkpoint.config pi05_libero \
+    --policy.checkpoint.dir gs://path/to/checkpoint \
+    --quantize \
+    --quantize-bits 8 \
+    --quantize-group-size 256
+
+# W2A2（最低精度，最大压缩）
+python scripts/serve_policy.py \
+    --policy.checkpoint.config pi05_libero \
+    --policy.checkpoint.dir gs://path/to/checkpoint \
+    --quantize \
+    --quantize-bits 2 \
+    --quantize-group-size 256
+    """

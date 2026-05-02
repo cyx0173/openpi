@@ -19,7 +19,8 @@ python scripts/serve_policy.py --env DROID --port 8000
 uv run examples/simple_client/main.py --env DROID --num_steps 20
 运行真实的数据集
 python examples/simple_client/real_main.py --env DROID --port 8000 --dataset-repo-id your_hf_username/my_droid_dataset 
-
+运行pytorch版本
+uv run scripts/serve_policy.py policy:checkpoint     --policy.config=pi05_droid     --policy.dir=checkpoints/pi05_droid_pytorch 
 转发文件：python3 -m http.server 8008 
 
 现在可以梳理清楚这个

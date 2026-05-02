@@ -66,9 +66,6 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
-        # Make a copy since transformations may modify the inputs in place.
-        #print("policy.model.action_horizon:", self._model.action_horizon)
-        #print("policy.model.action_dim:", self._model.action_dim)
         my_t0 = time.time()
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -93,13 +90,28 @@ class Policy(BasePolicy):
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         #为了传出准确的时间
-        print("model.sample_actions start time:", (time.time()-my_t0)*1000)
-        actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
-        print("model.sample_actions middle time:", (time.time()-my_t0)*1000)
+        
+        #print("model.sample_actions start time:", (time.time()-my_t0)*1000)
+        sample_result = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        # Support both old (actions only) and new (actions, hidden_states) return signatures
+        if isinstance(sample_result, tuple):
+            actions, prefix_hidden_states = sample_result
+        else:
+            actions = sample_result
+            prefix_hidden_states = None
+        ''' 
+        if self._model._last_timing_stats is not None:
+            p1, p2, total = self._model._last_timing_stats
+            print(f"Prefill: {p1:.2f}ms | Denoise: {p2:.2f}ms | Total: {total:.2f}ms")
+            print("="*52 + "\n")
+        '''          
         outputs = {
             "state": inputs["state"],
             "actions": actions,
         }
+        # Include prefix hidden states for Q-Selector (CPQ)
+        if prefix_hidden_states is not None:
+            outputs["prefix_hidden_states"] = prefix_hidden_states
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
@@ -109,12 +121,16 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
-        print("model.sample_actions end time:", (time.time()-my_t0)*1000)
         return outputs
 
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+    def reset_rng(self, seed: int = 0) -> None:
+        """Reset the internal RNG to a fixed seed. Useful when starting a new episode."""
+        if not self._is_pytorch_model:
+            self._rng = jax.random.key(seed)
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

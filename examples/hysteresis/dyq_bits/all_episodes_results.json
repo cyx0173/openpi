@@ -1,0 +1,382 @@
+[
+  {
+    "task_id": 0,
+    "episode_idx": 0,
+    "num_steps": 310,
+    "thresholds": {
+      "theta_fp": 0.5787385584984399,
+      "theta_4_8": 0.4599054793807072,
+      "theta_2_4": 0.33654290492638406
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.4155948163897197,
+      "std_sensitivity": 0.20473417275336095,
+      "max_sensitivity": 1.23688737578785,
+      "min_sensitivity": 0.009032846869193839,
+      "mean_bits": 8.819354838709678,
+      "bit_counts": {
+        "2": 15,
+        "4": 84,
+        "8": 126,
+        "16": 85
+      },
+      "num_upgrades": 11,
+      "num_downgrades": 11,
+      "fraction_fp": 0.27419354838709675,
+      "fraction_8bit": 0.4064516129032258,
+      "fraction_4bit": 0.2709677419354839,
+      "fraction_2bit": 0.04838709677419355
+    },
+    "task_description": "put both the alphabet soup and the tomato sauce in the basket",
+    "success": true
+  },
+  {
+    "task_id": 1,
+    "episode_idx": 0,
+    "num_steps": 242,
+    "thresholds": {
+      "theta_fp": 0.581250268765017,
+      "theta_4_8": 0.4496189698913756,
+      "theta_2_4": 0.3220164158052842
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.3549991618682439,
+      "std_sensitivity": 0.18591838276967887,
+      "max_sensitivity": 0.8093689723312898,
+      "min_sensitivity": 0.04150488155102055,
+      "mean_bits": 10.694214876033058,
+      "bit_counts": {
+        "2": 0,
+        "4": 5,
+        "8": 153,
+        "16": 84
+      },
+      "num_upgrades": 11,
+      "num_downgrades": 9,
+      "fraction_fp": 0.34710743801652894,
+      "fraction_8bit": 0.6322314049586777,
+      "fraction_4bit": 0.02066115702479339,
+      "fraction_2bit": 0.0
+    },
+    "task_description": "put both the cream cheese box and the butter in the basket",
+    "success": true
+  },
+  {
+    "task_id": 2,
+    "episode_idx": 0,
+    "num_steps": 255,
+    "thresholds": {
+      "theta_fp": 0.5794489806034454,
+      "theta_4_8": 0.45579994477739566,
+      "theta_2_4": 0.3358046343125649
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.4190219092628307,
+      "std_sensitivity": 0.23525380054722234,
+      "max_sensitivity": 1.3540369384619617,
+      "min_sensitivity": 0.021057038295679502,
+      "mean_bits": 8.235294117647058,
+      "bit_counts": {
+        "2": 48,
+        "4": 37,
+        "8": 108,
+        "16": 62
+      },
+      "num_upgrades": 10,
+      "num_downgrades": 9,
+      "fraction_fp": 0.24313725490196078,
+      "fraction_8bit": 0.4235294117647059,
+      "fraction_4bit": 0.1450980392156863,
+      "fraction_2bit": 0.18823529411764706
+    },
+    "task_description": "turn on the stove and put the moka pot on it",
+    "success": true
+  },
+  {
+    "task_id": 3,
+    "episode_idx": 0,
+    "num_steps": 248,
+    "thresholds": {
+      "theta_fp": 0.573339682350524,
+      "theta_4_8": 0.45330695047203756,
+      "theta_2_4": 0.33094868063145283
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.38174559509685246,
+      "std_sensitivity": 0.16235685991469564,
+      "max_sensitivity": 0.8973802970239657,
+      "min_sensitivity": 0.06646806243901839,
+      "mean_bits": 9.830645161290322,
+      "bit_counts": {
+        "2": 9,
+        "4": 13,
+        "8": 156,
+        "16": 70
+      },
+      "num_upgrades": 12,
+      "num_downgrades": 10,
+      "fraction_fp": 0.28225806451612906,
+      "fraction_8bit": 0.6290322580645161,
+      "fraction_4bit": 0.05241935483870968,
+      "fraction_2bit": 0.036290322580645164
+    },
+    "task_description": "put the black bowl in the bottom drawer of the cabinet and close it",
+    "success": true
+  },
+  {
+    "task_id": 4,
+    "episode_idx": 0,
+    "num_steps": 246,
+    "thresholds": {
+      "theta_fp": 0.5692911956627411,
+      "theta_4_8": 0.44859322037500166,
+      "theta_2_4": 0.3404737273510122
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.3884316709539258,
+      "std_sensitivity": 0.1509217779973876,
+      "max_sensitivity": 0.7956192603168596,
+      "min_sensitivity": 0.07409063493421479,
+      "mean_bits": 8.504065040650406,
+      "bit_counts": {
+        "2": 8,
+        "4": 73,
+        "8": 107,
+        "16": 58
+      },
+      "num_upgrades": 13,
+      "num_downgrades": 12,
+      "fraction_fp": 0.23577235772357724,
+      "fraction_8bit": 0.4349593495934959,
+      "fraction_4bit": 0.2967479674796748,
+      "fraction_2bit": 0.032520325203252036
+    },
+    "task_description": "put the white mug on the left plate and put the yellow and white mug on the right plate",
+    "success": true
+  },
+  {
+    "task_id": 5,
+    "episode_idx": 0,
+    "num_steps": 186,
+    "thresholds": {
+      "theta_fp": 0.5823569954144845,
+      "theta_4_8": 0.4562511212671324,
+      "theta_2_4": 0.3540538001609226
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.43702563859093335,
+      "std_sensitivity": 0.1540094043860739,
+      "max_sensitivity": 1.0324063590994859,
+      "min_sensitivity": 0.0,
+      "mean_bits": 9.279569892473118,
+      "bit_counts": {
+        "2": 9,
+        "4": 59,
+        "8": 52,
+        "16": 66
+      },
+      "num_upgrades": 10,
+      "num_downgrades": 9,
+      "fraction_fp": 0.3548387096774194,
+      "fraction_8bit": 0.27956989247311825,
+      "fraction_4bit": 0.3172043010752688,
+      "fraction_2bit": 0.04838709677419355
+    },
+    "task_description": "pick up the book and place it in the back compartment of the caddy",
+    "success": true
+  },
+  {
+    "task_id": 6,
+    "episode_idx": 0,
+    "num_steps": 216,
+    "thresholds": {
+      "theta_fp": 0.5839933173100178,
+      "theta_4_8": 0.4610521407933107,
+      "theta_2_4": 0.34789577105026204
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.433495212909238,
+      "std_sensitivity": 0.17111461616774498,
+      "max_sensitivity": 0.9642731866693905,
+      "min_sensitivity": 0.016923804724615712,
+      "mean_bits": 10.38888888888889,
+      "bit_counts": {
+        "2": 2,
+        "4": 24,
+        "8": 112,
+        "16": 78
+      },
+      "num_upgrades": 11,
+      "num_downgrades": 13,
+      "fraction_fp": 0.3611111111111111,
+      "fraction_8bit": 0.5185185185185185,
+      "fraction_4bit": 0.1111111111111111,
+      "fraction_2bit": 0.009259259259259259
+    },
+    "task_description": "put the white mug on the plate and put the chocolate pudding to the right of the plate",
+    "success": true
+  },
+  {
+    "task_id": 7,
+    "episode_idx": 0,
+    "num_steps": 243,
+    "thresholds": {
+      "theta_fp": 0.5611020860240535,
+      "theta_4_8": 0.4502566253850763,
+      "theta_2_4": 0.3371738849097818
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.3900350664899397,
+      "std_sensitivity": 0.15027982046741864,
+      "max_sensitivity": 0.9786226170123655,
+      "min_sensitivity": 0.04625707089152689,
+      "mean_bits": 8.345679012345679,
+      "bit_counts": {
+        "2": 4,
+        "4": 73,
+        "8": 116,
+        "16": 50
+      },
+      "num_upgrades": 11,
+      "num_downgrades": 10,
+      "fraction_fp": 0.205761316872428,
+      "fraction_8bit": 0.4773662551440329,
+      "fraction_4bit": 0.3004115226337449,
+      "fraction_2bit": 0.01646090534979424
+    },
+    "task_description": "put both the alphabet soup and the cream cheese box in the basket",
+    "success": true
+  },
+  {
+    "task_id": 8,
+    "episode_idx": 0,
+    "num_steps": 410,
+    "thresholds": {
+      "theta_fp": 0.5808698660899014,
+      "theta_4_8": 0.46448593072219124,
+      "theta_2_4": 0.3524345386655604
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.41768745696416193,
+      "std_sensitivity": 0.16623803368094422,
+      "max_sensitivity": 0.8174787762917937,
+      "min_sensitivity": 0.033846896560789264,
+      "mean_bits": 9.595121951219513,
+      "bit_counts": {
+        "2": 5,
+        "4": 73,
+        "8": 210,
+        "16": 122
+      },
+      "num_upgrades": 14,
+      "num_downgrades": 13,
+      "fraction_fp": 0.2975609756097561,
+      "fraction_8bit": 0.5121951219512195,
+      "fraction_4bit": 0.17804878048780487,
+      "fraction_2bit": 0.012195121951219513
+    },
+    "task_description": "put both moka pots on the stove",
+    "success": true
+  },
+  {
+    "task_id": 9,
+    "episode_idx": 0,
+    "num_steps": 246,
+    "thresholds": {
+      "theta_fp": 0.5920216683847958,
+      "theta_4_8": 0.46793808049882635,
+      "theta_2_4": 0.3507260169238846
+    },
+    "params": {
+      "w_macro": 10,
+      "w_micro": 3,
+      "lambda_param": 0.5,
+      "K": 5,
+      "method": "percentile"
+    },
+    "stats": {
+      "mean_sensitivity": 0.442844743817983,
+      "std_sensitivity": 0.14998949516134985,
+      "max_sensitivity": 0.8877036275469004,
+      "min_sensitivity": 0.06411771262210025,
+      "mean_bits": 9.422764227642276,
+      "bit_counts": {
+        "2": 33,
+        "4": 57,
+        "8": 59,
+        "16": 97
+      },
+      "num_upgrades": 18,
+      "num_downgrades": 19,
+      "fraction_fp": 0.3943089430894309,
+      "fraction_8bit": 0.23983739837398374,
+      "fraction_4bit": 0.23170731707317074,
+      "fraction_2bit": 0.13414634146341464
+    },
+    "task_description": "put the yellow and white mug in the microwave and close it",
+    "success": true
+  }
+]

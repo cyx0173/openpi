@@ -136,12 +136,13 @@ def main(args: Args) -> None:
     timing_recorder = TimingRecorder()
 
     for _ in tqdm.trange(args.num_steps, desc="Running policy"):
+        obs = obs_fn()
         inference_start = time.time()
         #action_start 的地方 开始推理
         t1 = time.time() - t0
-        print("Start inference time",t1*1000 )
-        action = policy.infer(obs_fn())
-        print("end inference time",(time.time() - t1)*1000 )
+        #print("Start inference time",t1*1000 )
+        action = policy.infer(obs)
+        #print("end inference time",(time.time() - t1)*1000 )
         timing_recorder.record("client_infer_ms", 1000 * (time.time() - inference_start))
         for key, value in action.get("server_timing", {}).items():
             timing_recorder.record(f"server_{key}", value)
