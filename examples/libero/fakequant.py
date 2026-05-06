@@ -20,14 +20,24 @@ Key improvements over naive FakeQuant (max + per-channel):
      - Even finer granularity for activations if needed
 
 Usage:
-    from fakequant import apply_fake_quant, FakeQuantLinear, calibrate_model
+    from fakequant import apply_fake_quant, FakeQuantLinear, calibrate_model, CalibrationRunner
 
-    # Option A: Apply with default settings
+    # Option A: Apply with default settings (online scale computation per forward pass)
     apply_fake_quant(model, bits=4, group_size=128, percentile=99.9)
 
-    # Option B: Calibrate on representative data then apply
+    # Option B: Explicit calibration then apply
     calibrate_model(model, calibration_data, bits=4)
     apply_fake_quant(model, bits=4, group_size=128)
+
+    # Option C: Online collection + persistence (avoids repeated sorting per forward pass)
+    runner = CalibrationRunner(model)
+    runner.start_online_collection(model)         # start silently collecting
+    for batch in data:                            # normal forward passes
+        model(batch)
+    runner.finish_online_collection()            # bake into _x_scales/_x_zero_pts
+    runner.save_calibration("./calib/")           # persist to disk
+    # Next run — load instead of recomputing:
+    runner.load_calibration("./calib/")          # reuse cached scales
 
     # Remove quantization
     remove_fake_quant(model)
@@ -263,6 +273,14 @@ class FakeQuantLinear(nn.Module):
         self._calib_medians: Optional[list[torch.Tensor]] = None    # list of (N, 1) per batch
         self._calib_num_batches: int = 0
 
+        # ---- Online stats collection state ----
+        # When _collecting_online_stats=True, the layer silently accumulates stats
+        # during regular forward passes (without explicit calibration mode).
+        # After collection, call finish_online_collection() to bake them into _x_scales/_x_zero_pts.
+        self._collecting_online_stats: bool = False
+        self._online_abs_maxes: Optional[list[torch.Tensor]] = None  # list of (N, 1) per batch
+        self._online_medians: Optional[list[torch.Tensor]] = None   # list of (N, 1) per batch
+
     @property
     def in_features(self) -> int:
         return self._linear.in_features
@@ -322,9 +340,10 @@ class FakeQuantLinear(nn.Module):
                 if abs_flat.numel() == 0:
                     continue
 
-                pct_idx = int(round(self._percentile / 100.0 * (abs_flat.numel() - 1)))
-                pct_idx = min(max(pct_idx, 0), abs_flat.numel() - 1)
-                pct_val = abs_flat.view(-1)[pct_idx]
+                sorted_abs, _ = torch.sort(abs_flat)
+                pct_idx = int(round(self._percentile / 100.0 * (sorted_abs.numel() - 1)))
+                pct_idx = min(max(pct_idx, 0), sorted_abs.numel() - 1)
+                pct_val = sorted_abs[pct_idx]
 
                 if pct_val > 1e-9:
                     scales[g] = pct_val / levels
@@ -426,18 +445,25 @@ class FakeQuantLinear(nn.Module):
             median_vals = torch.median(x_flat, dim=1, keepdim=True)[0]
             zero_pts = torch.round(median_vals / scales)
 
+            # ---- Silently collect online stats for future reuse ----
+            if self._collecting_online_stats:
+                self._online_abs_maxes.append(max_vals.detach().clone())
+                self._online_medians.append(median_vals.detach().clone())
+
         q_min = -(2 ** (bits - 1))
         q_max = 2 ** (bits - 1) - 1
-        zero_pts = torch.clamp(zero_pts, q_min, q_max)
 
-        x_centered = x_flat - zero_pts
+        zero_pts = torch.clamp(zero_pts, q_min, q_max)
+        zero_pts_float = zero_pts * scales
+
+        x_centered = x_flat - zero_pts_float
         x_norm = x_centered / scales
         if self._stochastic_round:
             x_q = stochastic_round(x_norm)
         else:
             x_q = torch.round(x_norm)
         x_q = torch.clamp(x_q, q_min, q_max)
-        x_deq = x_q * scales + zero_pts
+        x_deq = x_q * scales + zero_pts_float
         return x_deq.reshape(orig_shape)
 
     def start_calibration(self) -> None:
@@ -498,6 +524,69 @@ class FakeQuantLinear(nn.Module):
         self._calib_abs_maxes = None
         self._calib_medians = None
 
+    def start_online_collection(self) -> None:
+        """Begin silently collecting activation stats during regular forward passes.
+
+        After collecting enough data, call finish_online_collection() to bake the
+        accumulated stats into _x_scales / _x_zero_pts for reuse across runs.
+        """
+        self._collecting_online_stats = True
+        self._online_abs_maxes = []
+        self._online_medians = []
+
+    def finish_online_collection(self) -> None:
+        """Finalize online collection: aggregate collected stats into _x_scales / _x_zero_pts.
+
+        Subsequent forward passes use the cached scales instead of recomputing
+        per-batch online statistics (no more repeated sorting per forward pass).
+        """
+        if not self._collecting_online_stats or not self._online_abs_maxes:
+            self._collecting_online_stats = False
+            return
+
+        self._collecting_online_stats = False
+
+        abs_max_cat = torch.cat(self._online_abs_maxes, dim=0)   # (total_tokens, 1)
+        median_cat = torch.cat(self._online_medians, dim=0)        # (total_tokens, 1)
+
+        abs_max_agg, _ = abs_max_cat.max(dim=0, keepdim=True)
+        median_agg, _ = median_cat.max(dim=0, keepdim=True)
+
+        abs_max_agg = abs_max_agg.squeeze(0)
+        median_agg = median_agg.squeeze(0)
+
+        self._x_scales = abs_max_agg.unsqueeze(0) if abs_max_agg.dim() == 0 else abs_max_agg
+        self._x_zero_pts = median_agg.unsqueeze(0) if median_agg.dim() == 0 else median_agg
+
+        self._online_abs_maxes = None
+        self._online_medians = None
+
+    def save_calibration(self, path: str | Path) -> None:
+        """Save calibrated activation scales and zero-points to disk.
+
+        Args:
+            path: File path to save the calibration state dict.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            "x_scales": self._x_scales.cpu() if self._x_scales is not None else None,
+            "x_zero_pts": self._x_zero_pts.cpu() if self._x_zero_pts is not None else None,
+            "percentile": self._percentile,
+        }
+        torch.save(state, path)
+
+    def load_calibration(self, path: str | Path) -> None:
+        """Load pre-computed activation calibration from disk.
+
+        Args:
+            path: File path to load the calibration state dict from.
+        """
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        self._x_scales = state["x_scales"]
+        self._x_zero_pts = state["x_zero_pts"]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bits = self.current_bits
         if bits >= 16:
@@ -525,6 +614,7 @@ class FakeQuantLinear(nn.Module):
             self._calib_num_batches += 1
 
         return F.linear(x_deq, w_deq, self._linear.bias)
+        #依然在做标准的 FP16/FP32 浮点数矩阵乘法
 
 
 # --------------------------------------------------------------------------
@@ -535,7 +625,7 @@ class CalibrationRunner:
     """
     Orchestrates activation calibration for all FakeQuantLinear layers in a model.
 
-    Usage:
+    Usage (explicit calibration):
         runner = CalibrationRunner(model)
         for batch in calibration_data:
             runner.run_batch(model, batch)   # forward pass with hooks
@@ -543,6 +633,17 @@ class CalibrationRunner:
 
     After finish(), all FakeQuantLinear layers use their calibrated scales
     for activation quantization.
+
+    Usage (online collection + persistence):
+        runner = CalibrationRunner(model)
+        runner.start_online_collection(model)          # start silently collecting
+        for batch in data:                               # normal forward passes
+            model(batch)
+        runner.finish_online_collection()               # bake stats into _x_scales/_x_zero_pts
+        runner.save_calibration("./calib/")              # persist to disk
+
+        # Next run — load instead of recomputing:
+        runner.load_calibration("./calib/")             # reuse cached scales
     """
 
     def __init__(self, percentile: float = 99.9):
@@ -566,6 +667,46 @@ class CalibrationRunner:
         for layer in self._layers:
             layer.finish_calibration(percentile=self._percentile)
         self._layers.clear()
+
+    # ---- Online collection variants ----
+
+    def start_online_collection(self, model: torch.nn.Module) -> None:
+        """Start silently collecting activation stats during regular forward passes.
+
+        After running enough data through the model, call finish_online_collection()
+        to bake the stats into each layer's _x_scales / _x_zero_pts.
+        """
+        from fakequant import get_all_fakequant_layers
+        self._layers = get_all_fakequant_layers(model)
+        for layer in self._layers:
+            layer.start_online_collection()
+
+    def finish_online_collection(self) -> None:
+        """Finalize online collection for all layers."""
+        for layer in self._layers:
+            layer.finish_online_collection()
+        # NOTE: _layers is NOT cleared here — call save_calibration() before clearing.
+
+    def save_calibration(self, path: str | Path) -> None:
+        """Save calibration state (scales + zero-points) for all layers to disk.
+
+        Args:
+            path: Directory path. Each layer saves to <path>/layer_<id>.pt.
+        """
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        for layer in self._layers:
+            layer.save_calibration(path / f"layer_{layer._layer_id}.pt")
+
+    def load_calibration(self, path: str | Path) -> None:
+        """Load pre-computed calibration for all layers from disk.
+
+        Args:
+            path: Directory path. Each layer loads from <path>/layer_<id>.pt.
+        """
+        path = Path(path)
+        for layer in self._layers:
+            layer.load_calibration(path / f"layer_{layer._layer_id}.pt")
 
 
 # --------------------------------------------------------------------------

@@ -187,7 +187,6 @@ def eval_libero(args: Args) -> None:
                         action_plan.extend(action_chunk[: args.replan_steps])
 
                     action = action_plan.popleft()
-
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
                     if done:

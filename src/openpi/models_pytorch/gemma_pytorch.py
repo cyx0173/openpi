@@ -108,11 +108,16 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                output_hidden_states=output_hidden_states,
             )
             prefix_past_key_values = prefix_output.past_key_values
+            if output_hidden_states:
+                prefix_hidden_states = list(prefix_output.hidden_states)
+            else:
+                prefix_hidden_states = None
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
-            extra_output = {"prefix_hidden_states": None, "suffix_hidden_states": None}
+            extra_output = {"prefix_hidden_states": prefix_hidden_states, "suffix_hidden_states": None}
             if output_hidden_states:
                 return [prefix_output, suffix_output], prefix_past_key_values, extra_output
             return [prefix_output, suffix_output], prefix_past_key_values
@@ -124,11 +129,16 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                output_hidden_states=output_hidden_states,
             )
+            if output_hidden_states:
+                suffix_hidden_states = list(suffix_output.hidden_states)
+            else:
+                suffix_hidden_states = None
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
-            extra_output = {"prefix_hidden_states": None, "suffix_hidden_states": None}
+            extra_output = {"prefix_hidden_states": None, "suffix_hidden_states": suffix_hidden_states}
             if output_hidden_states:
                 return [prefix_output, suffix_output], prefix_past_key_values, extra_output
             return [prefix_output, suffix_output], prefix_past_key_values
