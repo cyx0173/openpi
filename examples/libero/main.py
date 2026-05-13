@@ -79,7 +79,7 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/libero/videos"  # Path to save videos
+    video_out_path: str = "data/libero_4bit/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -180,7 +180,15 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        result = client.infer(element)
+                        print("=== FULL SERVER RESPONSE ===")
+                        for k, v in result.items():
+                            if hasattr(v, 'shape'):
+                                print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+                            else:
+                                print(f"  {k}: {v}")
+                        print("=" * 40)
+                        action_chunk = result["actions"]
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."

@@ -92,6 +92,7 @@ class Policy(BasePolicy):
         #为了传出准确的时间
         
         #print("model.sample_actions start time:", (time.time()-my_t0)*1000)
+        # 此处被修改了，我们将这个隐藏层向量的接口暴露回来了
         sample_result = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         # Support both old (actions only) and new (actions, hidden_states) return signatures
         if isinstance(sample_result, tuple):
@@ -99,25 +100,35 @@ class Policy(BasePolicy):
         else:
             actions = sample_result
             prefix_hidden_states = None
-        ''' 
-        if self._model._last_timing_stats is not None:
-            p1, p2, total = self._model._last_timing_stats
-            print(f"Prefill: {p1:.2f}ms | Denoise: {p2:.2f}ms | Total: {total:.2f}ms")
-            print("="*52 + "\n")
-        '''          
+        if prefix_hidden_states is not None:
+            def _tensor_to_numpy(t):
+                t = t[0, ...].detach().cpu()
+                if t.dtype in (torch.bfloat16, torch.float16):
+                    t = t.to(torch.float32)
+                return np.asarray(t)
+            prefix_hidden_states_np = [_tensor_to_numpy(t) for t in prefix_hidden_states]
         outputs = {
             "state": inputs["state"],
             "actions": actions,
         }
-        # Include prefix hidden states for Q-Selector (CPQ)
-        if prefix_hidden_states is not None:
-            outputs["prefix_hidden_states"] = prefix_hidden_states
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+            def _to_numpy(x):
+                if isinstance(x, list):
+                    return [_to_numpy(item) for item in x]
+                if isinstance(x, np.ndarray):
+                    return x
+                x = x[0, ...].detach().cpu()
+                if x.dtype in (torch.bfloat16, torch.float16):
+                    x = x.to(torch.float32)
+                return np.asarray(x)
+            outputs = jax.tree.map(_to_numpy, outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
         outputs = self._output_transform(outputs)
+        # Restore prefix_hidden_states after output_transform (which may have stripped it)
+        if prefix_hidden_states is not None:
+            outputs["prefix_hidden_states"] = prefix_hidden_states_np
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

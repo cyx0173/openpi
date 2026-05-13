@@ -4,13 +4,16 @@ quant_main.py - Unified trajectory recording + perturbation sensitivity evaluati
 Modes:
   Mode 1 (basic):       Record FP16 baseline trajectories. Outputs _trajectory.json.
                          Server: --port (FP16).
-  Mode 2 (combined):    Record both FP16 and W4A4 trajectories + mujoco_state.
+  Mode 2 (combined):    Record FP16 + W4A4 trajectories + mujoco_state.
                          Outputs _combined.json (required by Mode 3/4).
                          Servers: --port (FP16) and --w4a4_port (W4A4).
   Mode 3 (chunk):       Chunk-level perturbation: inject W4A4 chunk k, then FP16 inference.
                          Server: --port (FP16 inference). Needs _combined.json from Mode 2.
   Mode 4 (step):        Step-level perturbation: inject W4A4 action at step (k,s), replay FP16.
                          Server: --port (FP16 inference). Needs _combined.json from Mode 2.
+  Mode 5 (quad):        Record FP16 + W4A4 + W4A8 + W4A16 trajectories + mujoco_state.
+                         Outputs _combined.json.
+                         Servers: --port (FP16), --w4a4_port (W4A4), --w4a8_port (W4A8), --w4a16_port (W4A16).
 
 Usage:
   # Mode 1 - Record FP16 baseline trajectories (single server on port 8000)
@@ -21,12 +24,23 @@ Usage:
 
   # Mode 2 - Record FP16 + W4A4 trajectories (dual servers)
   #   Terminal 1 (FP16):  uv run python scripts/serve_policy.py --env LIBERO --port 8001
-  #   Terminal 2 (W4A4):  uv run python scripts/serve_policy.py --env LIBERO --port 8000 --quantize --quantize-bits 4
+  #   Terminal 2 (W4A4):  uv run python scripts/serve_policy.py --env LIBERO --port 8000 --quantize --quantize-bits-w 4 --quantize-bits-a 4
   #   This script:
   uv run python examples/libero/quant_main.py \
-      --args.mode 2 --args.task_suite_name libero_spatial \
-      --args.port 8001 --args.w4a4_port 8000 \
-      --args.output_dir data/quant_spatial/quant_w4a4
+      --mode 2 --task_suite_name libero_spatial \
+      --port 8001 --w4a4_port 8000 \
+      --output_dir data/libero/videos/quant_w4a4
+
+  # Mode 5 - Record FP16 + W4A4 + W4A8 + W4A16 trajectories (quad servers)
+  #   Terminal 1 (FP16):   uv run python scripts/serve_policy.py --env LIBERO --port 8001
+  #   Terminal 2 (W4A4):   uv run python scripts/serve_policy.py --env LIBERO --port 8000 --quantize --quantize-bits-w 4 --quantize-bits-a 4
+  #   Terminal 3 (W4A8):   uv run python scripts/serve_policy.py --env LIBERO --port 8002 --quantize --quantize-bits-w 4 --quantize-bits-a 8
+  #   Terminal 4 (W4A16):  uv run python scripts/serve_policy.py --env LIBERO --port 8003 --quantize --quantize-bits-w 4 --quantize-bits-a 16
+  #   This script:
+  uv run python examples/libero/quant_main.py \
+      --mode 5 --task_suite_name libero_spatial \
+      --port 8001 --w4a4_port 8000 --w4a8_port 8002 --w4a16_port 8003 \
+      --output_dir data/libero/videos/quant_all
 
   # Mode 3 - Chunk-level perturbation (needs _combined.json from Mode 2)
   uv run python examples/libero/quant_main.py \
@@ -42,6 +56,7 @@ Usage:
       --combined_dir data/libero/videos/quant_w4a4 \
       --output_dir data/quant/spatial_step_results
 """
+
 import collections
 import dataclasses
 import json
@@ -114,27 +129,33 @@ class Args:
     port: int = 8001
     # W4A4 server port (only for Mode 2 dual-server recording)
     w4a4_port: int = 8000
+    # W4A8 server port (only for Mode 5 quad-server recording)
+    w4a8_port: int = 8002
+    # W4A16 server port (only for Mode 5 quad-server recording)
+    w4a16_port: int = 8003
 
     # ── Task ─────────────────────────────────────────────────────────────────
-    task_suite_name: str = "libero_spatial"
+    task_suite_name: str = "libero_10"
     num_steps_wait: int = 10
     seed: int = 7
     resize_size: int = 224
     replan_steps: int = 5
 
     # ── Mode ─────────────────────────────────────────────────────────────────
-    # 1 = record basic (W4A4 only), 2 = record combined (FP16 + W4A4 dual server),
-    # 3 = chunk-level perturbation, 4 = step-level perturbation
-    mode: int = 2
+    # 1 = record basic (FP16), 2 = record combined (FP16 + W4A4 dual server),
+    # 3 = chunk-level perturbation, 4 = step-level perturbation,
+    # 5 = record combined (FP16 + W4A4 + W4A8 + W4A16 quad server),
+    # 6 = active data collection (needs Mode 5 _combined.json, separate file active_main.py)
+    mode: int = 5
 
-    # ── Recording (Mode 1 / 2) ───────────────────────────────────────────────
-    output_dir: str = "data/quant_spatial/quant_w4a4"
-    video_dir: str = "data/quant_spatial/videos"
+    # ── Recording (Mode 1 / 2) ──────────────────────────────────────────────
+    output_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/dataset/quant_10/quant_w4a4"
+    video_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/dataset/quant_10/videos"
     task_name: str = ""
     skip_existing: bool = True
 
     # ── Perturbation (Mode 3 / 4) ────────────────────────────────────────────
-    combined_dir: str = "/home/chengyuxuan/vla/openpi/data/quant_spatial/quant_w4a4"
+    combined_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/dataset/quant_10/combined"
     trajectory_list: str = ""
 
 
@@ -227,7 +248,7 @@ def _record_mode1(env, task, task_description, initial_state, client, args):
     obs = env.set_init_state(initial_state)
     done = False
     t = 0
-    max_steps = _MAX_STEPS.get(args.task_suite_name, 300)
+    max_steps = _MAX_STEPS.get(args.task_suite_name, 520)
     action_plan = collections.deque()
     replay_images = []
     steps = []
@@ -278,13 +299,15 @@ def _record_mode2(env, task, task_description, initial_state, w4a4_client, fp16_
     obs = env.set_init_state(initial_state)
     done = False
     t = 0
-    max_steps = _MAX_STEPS.get(args.task_suite_name, 300)
+    max_steps = _MAX_STEPS.get(args.task_suite_name, 520)
     w4a4_plan = collections.deque()
     fp16_plan = collections.deque()
     replay_images = []
     chunks = []
     current_fp16 = []
     current_w4a4 = []
+    current_w4a8 = []
+    current_w4a16 = []
     chunk_step_start = args.num_steps_wait
 
     while t < max_steps + args.num_steps_wait:
@@ -385,6 +408,147 @@ def _record_mode2(env, task, task_description, initial_state, w4a4_client, fp16_
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MODE 5: Combined FP16 + W4A4 + W4A8 + W4A16 quad-server recording
+# ═══════════════════════════════════════════════════════════════════════════════
+def _record_mode5(env, task, task_description, initial_state,
+                   fp16_client, w4a4_client, w4a8_client, w4a16_client, args):
+    """
+    Record trajectory with FP16, W4A4, W4A8, and W4A16 actions by querying four servers simultaneously.
+    Each replan window = one chunk. Stores fp16_actions, w4a4_actions, w4a8_actions, w4a16_actions, mujoco_state per chunk.
+    """
+    env.reset()
+    obs = env.set_init_state(initial_state)
+    done = False
+    t = 0
+    max_steps = _MAX_STEPS.get(args.task_suite_name, 520)
+    fp16_plan = collections.deque()
+    w4a4_plan = collections.deque()
+    w4a8_plan = collections.deque()
+    w4a16_plan = collections.deque()
+    replay_images = []
+    chunks = []
+    current_fp16 = []
+    current_w4a4 = []
+    current_w4a8 = []
+    current_w4a16 = []
+    chunk_step_start = args.num_steps_wait
+
+    while t < max_steps + args.num_steps_wait:
+        try:
+            if t < args.num_steps_wait:
+                obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                t += 1
+                continue
+
+            img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+            replay_images.append(img)
+
+            if not fp16_plan:
+                element = _get_obs_element(obs, task_description, args.resize_size)
+                fp16_result = fp16_client.infer(element)
+                w4a4_result = w4a4_client.infer(element)
+                w4a8_result = w4a8_client.infer(element)
+                w4a16_result = w4a16_client.infer(element)
+
+                mj = env.sim.get_state()
+                mujoco_state = {
+                    "time": float(mj.time),
+                    "qpos": [float(x) for x in mj.qpos],
+                    "qvel": [float(x) for x in mj.qvel],
+                }
+
+                if current_fp16:
+                    chunks.append({
+                        "chunk_idx": len(chunks),
+                        "step_start": chunk_step_start,
+                        "fp16_actions": current_fp16,
+                        "w4a4_actions": current_w4a4,
+                        "w4a8_actions": current_w4a8,
+                        "w4a16_actions": current_w4a16,
+                        "mujoco_state": mujoco_state,
+                    })
+
+                current_fp16 = []
+                current_w4a4 = []
+                current_w4a8 = []
+                current_w4a16 = []
+                chunk_step_start = t
+
+                fp16_plan.extend(fp16_result["actions"][: args.replan_steps].tolist())
+                w4a4_plan.extend(w4a4_result["actions"][: args.replan_steps].tolist())
+                w4a8_plan.extend(w4a8_result["actions"][: args.replan_steps].tolist())
+                w4a16_plan.extend(w4a16_result["actions"][: args.replan_steps].tolist())
+
+            fp16_action = fp16_plan.popleft()
+            w4a4_action = w4a4_plan.popleft()
+            w4a8_action = w4a8_plan.popleft()
+            w4a16_action = w4a16_plan.popleft()
+
+            obs, reward, done, info = env.step(fp16_action)
+
+            current_fp16.append(fp16_action)
+            current_w4a4.append(w4a4_action)
+            current_w4a8.append(w4a8_action)
+            current_w4a16.append(w4a16_action)
+            t += 1
+
+            if done:
+                if current_fp16:
+                    mj = env.sim.get_state()
+                    chunks.append({
+                        "chunk_idx": len(chunks),
+                        "step_start": chunk_step_start,
+                        "fp16_actions": current_fp16,
+                        "w4a4_actions": current_w4a4,
+                        "w4a8_actions": current_w4a8,
+                        "w4a16_actions": current_w4a16,
+                        "mujoco_state": {
+                            "time": float(mj.time),
+                            "qpos": [float(x) for x in mj.qpos],
+                            "qvel": [float(x) for x in mj.qvel],
+                        },
+                    })
+                return {"chunks": chunks, "success": done, "replay_images": replay_images}
+
+        except Exception as e:
+            logging.error(f"  Exception at step {t}: {e}")
+            if current_fp16:
+                mj = env.sim.get_state()
+                chunks.append({
+                    "chunk_idx": len(chunks),
+                    "step_start": chunk_step_start,
+                    "fp16_actions": current_fp16,
+                    "w4a4_actions": current_w4a4,
+                    "w4a8_actions": current_w4a8,
+                    "w4a16_actions": current_w4a16,
+                    "mujoco_state": {
+                        "time": float(mj.time),
+                        "qpos": [float(x) for x in mj.qpos],
+                        "qvel": [float(x) for x in mj.qvel],
+                    },
+                })
+            break
+
+    if current_fp16:
+        mj = env.sim.get_state()
+        chunks.append({
+            "chunk_idx": len(chunks),
+            "step_start": chunk_step_start,
+            "fp16_actions": current_fp16,
+            "w4a4_actions": current_w4a4,
+            "w4a8_actions": current_w4a8,
+            "w4a16_actions": current_w4a16,
+            "mujoco_state": {
+                "time": float(mj.time),
+                "qpos": [float(x) for x in mj.qpos],
+                "qvel": [float(x) for x in mj.qvel],
+            },
+        })
+
+    return {"chunks": chunks, "success": done, "replay_images": replay_images}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MODE 3 & 4: Perturbation helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 def _run_baseline_replay(env, initial_state, fp16_chunks, chunk_states, num_steps_wait):
@@ -461,7 +625,7 @@ def _run_with_chunk_perturbation(env, initial_state, w4a4_chunks,
                 return _get_eef_pos(env, obs), True, replay_images
 
     prev_eef = _get_eef_pos(env, obs)
-    MAX_STEPS = 300
+    MAX_STEPS = 600
     steps_taken = 0
     while not done and steps_taken < MAX_STEPS:
         try:
@@ -490,7 +654,7 @@ def _run_with_chunk_perturbation(env, initial_state, w4a4_chunks,
     return eef_pos, bool(done), replay_images
 
 
-def _run_with_step_perturbation(env, initial_state, w4a4_chunks,
+def _run_with_step_perturbation(env, initial_state, fp16_chunks, w4a4_chunks,
                                   chunk_states, num_steps_wait, chunk_perturb,
                                   step_perturb, task_description,
                                   fp16_client, args):
@@ -507,6 +671,27 @@ def _run_with_step_perturbation(env, initial_state, w4a4_chunks,
         if done:
             break
 
+    if chunk_perturb < len(chunk_states):
+        cs = chunk_states[chunk_perturb]
+        mj = env.sim.get_state()
+        mj.time = cs["time"]
+        mj.qpos[:] = cs["qpos"]
+        mj.qvel[:] = cs["qvel"]
+        env.sim.set_state(mj)
+        env.sim.forward()
+        obs = env.get_observation()
+
+    if chunk_perturb < len(fp16_chunks):
+        for a in fp16_chunks[chunk_perturb][:step_perturb]:
+            try:
+                obs, reward, done, info = env.step(a)
+            except ValueError:
+                done = True
+            img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+            replay_images.append(img)
+            if done:
+                return _get_eef_pos(env, obs), True, replay_images
+
     w4a4_action = w4a4_chunks[chunk_perturb][step_perturb]
     try:
         obs, reward, done, info = env.step(w4a4_action)
@@ -518,7 +703,7 @@ def _run_with_step_perturbation(env, initial_state, w4a4_chunks,
         return _get_eef_pos(env, obs), True, replay_images
 
     prev_eef = _get_eef_pos(env, obs)
-    MAX_STEPS = 300
+    MAX_STEPS = 600
     steps_taken = 0
     while not done and steps_taken < MAX_STEPS:
         try:
@@ -548,16 +733,20 @@ def _run_with_step_perturbation(env, initial_state, w4a4_chunks,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MODE 1 & 2: Recording dispatcher
+# MODE 1, 2 & 5: Recording dispatcher
 # ═══════════════════════════════════════════════════════════════════════════════
-def _run_recording(args: Args, fp16_client, w4a4_client=None) -> None:
+def _run_recording(args: Args, fp16_client, w4a4_client=None, w4a8_client=None, w4a16_client=None) -> None:
     np.random.seed(args.seed)
-    mode_name = {1: "Basic (FP16)", 2: "Combined (FP16 + W4A4)"}[args.mode]
+    mode_name = {1: "Basic (FP16)", 2: "Combined (FP16 + W4A4)", 5: "Combined (FP16 + W4A4 + W4A8 + W4A16)"}[args.mode]
     logging.info(f"Trajectory recording ({mode_name}, Mode {args.mode})")
     logging.info(f"  Task suite: {args.task_suite_name}")
     logging.info(f"  FP16 server: {args.host}:{args.port}")
     if args.mode == 2:
         logging.info(f"  W4A4 server:  {args.host}:{args.w4a4_port}")
+    if args.mode == 5:
+        logging.info(f"  W4A4 server:  {args.host}:{args.w4a4_port}")
+        logging.info(f"  W4A8 server:  {args.host}:{args.w4a8_port}")
+        logging.info(f"  W4A16 server: {args.host}:{args.w4a16_port}")
     logging.info(f"  Output dir: {args.output_dir}")
 
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -603,8 +792,20 @@ def _run_recording(args: Args, fp16_client, w4a4_client=None) -> None:
                     "success": bool(result["success"]),
                     "steps": result["steps"],
                 }
-            else:
+            elif args.mode == 2:
                 result = _record_mode2(env, task, task_description, initial_state, w4a4_client, fp16_client, args)
+                record = {
+                    "task_description": task_description,
+                    "task_id": task_id,
+                    "episode_idx": 0,
+                    "success": bool(result["success"]),
+                    "replan_steps": args.replan_steps,
+                    "num_chunks": len(result["chunks"]),
+                    "chunks": result["chunks"],
+                }
+            elif args.mode == 5:
+                result = _record_mode5(env, task, task_description, initial_state,
+                                       fp16_client, w4a4_client, w4a8_client, w4a16_client, args)
                 record = {
                     "task_description": task_description,
                     "task_id": task_id,
@@ -748,13 +949,14 @@ def _run_perturbation(args: Args, fp16_client) -> None:
             }
 
         elif args.mode == 4:
+            step_results = []
             for k in range(num_chunks):
                 num_steps = len(fp16_chunks[k])
                 for s in range(num_steps):
                     env_ks, _ = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
                     try:
                         perturb_eef, perturb_success, perturb_images = _run_with_step_perturbation(
-                            env_ks, initial_state, w4a4_chunks,
+                            env_ks, initial_state, fp16_chunks, w4a4_chunks,
                             chunk_states, args.num_steps_wait, k, s,
                             task_description, fp16_client, args
                         )
@@ -802,19 +1004,28 @@ def _run_perturbation(args: Args, fp16_client) -> None:
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 def main(args: Args) -> None:
-    if args.mode in (1, 2):
+    if args.mode == 1:
         fp16_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
-        w4a4_client = None
-        if args.mode == 2:
-            w4a4_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.w4a4_port)
+        _run_recording(args, fp16_client)
+
+    elif args.mode == 2:
+        fp16_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+        w4a4_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.w4a4_port)
         _run_recording(args, fp16_client, w4a4_client)
+
+    elif args.mode == 5:
+        fp16_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+        w4a4_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.w4a4_port)
+        w4a8_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.w4a8_port)
+        w4a16_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.w4a16_port)
+        _run_recording(args, fp16_client, w4a4_client, w4a8_client, w4a16_client)
 
     elif args.mode in (3, 4):
         fp16_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
         _run_perturbation(args, fp16_client)
 
     else:
-        logging.error(f"Unknown mode: {args.mode}. Use 1 (record basic), 2 (record combined), 3 (chunk perturb), or 4 (step perturb).")
+        logging.error(f"Unknown mode: {args.mode}. Use 1, 2, 3, 4, or 5.")
 
 
 if __name__ == "__main__":

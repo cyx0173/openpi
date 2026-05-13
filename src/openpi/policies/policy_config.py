@@ -24,7 +24,8 @@ def create_trained_policy(
     pytorch_device: str | None = None,
     # --- W4A4 Quantization args ---
     quantize: bool = False,
-    quantize_bits: int = 4,
+    quantize_bits_w: int = 4,
+    quantize_bits_a: int = 4,
     quantize_group_size: int = 256,
     # --- Activation calibration (only used when quantize=True) ---
     calibration_steps: int = 0,
@@ -47,12 +48,13 @@ def create_trained_policy(
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
-        presence of "model.safensors" in the checkpoint directory.
+        presence of "model.safetensors" in the checkpoint directory.
 
     Quantization:
         When quantize=True, applies DyQVLA-style W4A4 fake quantization to all nn.Linear
         layers in the PyTorch model. Only supported for PyTorch models (is_pytorch=True).
-        - quantize_bits: bit-width (default 4, also supports 2/8)
+        - quantize_bits_w: weight bit-width (default 4, also supports 2/8)
+        - quantize_bits_a: activation bit-width (default 4, also supports 2/8)
         - quantize_group_size: weight group size (default 256, tested optimal from benchmarks)
     """
     repack_transforms = repack_transforms or transforms.Group()
@@ -96,10 +98,10 @@ def create_trained_policy(
     # ============================================================
     if is_pytorch and quantize:
         import sys as _sys
-        _fakequant_dir = pathlib.Path(__file__).parent.parent.parent / "examples" / "libero"
+        _fakequant_dir = pathlib.Path("/home/chengyuxuan/vla/openpi/examples/libero")
         if _fakequant_dir.exists():
             _sys.path.insert(0, str(_fakequant_dir))
-            from fakequant import CalibrationRunner, apply_fake_quant, set_global_bits
+            from fakequant import apply_fake_quant, set_global_bits_w, set_global_bits_a
 
             # Layers that operate on the 7-dim action space stay FP16
             _exclude = [
@@ -114,15 +116,18 @@ def create_trained_policy(
 
             n_layers = apply_fake_quant(
                 model,
-                bits=quantize_bits,
+                bits_w=quantize_bits_w,
+                bits_a=quantize_bits_a,
                 group_size=quantize_group_size,
-                percentile=99.9,
+                percentile_w=99.9,
+                percentile_a=99.9,
                 quantize_activations=True,
                 exclude_names=_exclude,
                 exclude_bits=[2],  # don't pre-compute W2 scales
             )
-            set_global_bits(quantize_bits)
-            print(f"✅ W{quantize_bits}A{quantize_bits} FakeQuant applied to {n_layers} Linear layers "
+            set_global_bits_w(quantize_bits_w)
+            set_global_bits_a(quantize_bits_a)
+            print(f"✅ W{quantize_bits_w}A{quantize_bits_a} FakeQuant applied to {n_layers} Linear layers "
                   f"(group_size={quantize_group_size})")
 
             # ---- Activation calibration ----
@@ -131,6 +136,7 @@ def create_trained_policy(
                 import numpy as _np
                 import torch as _torch
                 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+                from openpi.models.tokenizer import PaligemmaTokenizer
 
                 calib_dir = calibration_data_dir or str(pathlib.Path(__file__).parent.parent.parent / "data" / "libero" / "videos" / "quant")
                 calib_path = pathlib.Path(calib_dir)
@@ -150,18 +156,28 @@ def create_trained_policy(
                             layer.start_calibration()
                         print(f"  Registered {len(calib_layers)} FakeQuantLinear layers for calibration")
 
+                        # Create tokenizer once (stateless, shared across all calibration steps)
+                        max_token_len = train_config.model.max_token_len
+                        _tokenizer = PaligemmaTokenizer(max_len=max_token_len)
+
                         # Build a helper to create Observation objects from raw dicts
                         def _make_obs(state_np, images_dict, lang_prompt, device):
                             """Build a model.Observation from raw numpy dicts."""
+                            # Tokenize the language prompt
+                            tokenized, mask = _tokenizer.tokenize(lang_prompt, state=None)
+                            tokenized_prompt = _np.asarray(tokenized, dtype=_np.int32)
+                            tokenized_prompt_mask = _np.asarray(mask, dtype=_np.bool_)
+
                             obs_raw = {
                                 "state": _np.asarray(state_np, dtype=_np.float32),
-                                "image": {k: _np.asarray(v, dtype=_np.uint8) for k, v in images_dict.items()},
-                                "image_mask": {
+                                "images": {k: _np.asarray(v, dtype=_np.uint8) for k, v in images_dict.items()},
+                                "image_masks": {
                                     "base_0_rgb": True,
                                     "left_wrist_0_rgb": True,
                                     "right_wrist_0_rgb": False,
                                 },
-                                "prompt": lang_prompt,
+                                "tokenized_prompt": tokenized_prompt,
+                                "tokenized_prompt_mask": tokenized_prompt_mask,
                             }
 
                             class _DictObs:

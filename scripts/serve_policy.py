@@ -3,6 +3,7 @@ import enum
 import logging
 import os
 import socket
+import torch
 
 import tyro
 from openpi.models.gemma import set_attention_log_file
@@ -55,17 +56,25 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
-    # --- DyQVLA-style W4A4 Quantization (PyTorch models only) ---
+    # --- DyQVLA-style WxAy Quantization (PyTorch models only) ---
     # If True, apply fake quantization to all nn.Linear layers.
     quantize: bool = False
-    # Bit-width for quantization. Options: 4, 8, 16 (16 = full precision bypass).
-    quantize_bits: int = 4
+    # Bit-width for weight quantization. Options: 4, 8, 16 (16 = full precision bypass).
+    quantize_bits_w: int = 4
+    # Bit-width for activation quantization. Options: 4, 8, 16 (16 = full precision bypass).
+    quantize_bits_a: int = 4
     # Weight group size for per-group quantization. 256 is recommended (tested optimal).
     quantize_group_size: int = 256
     # Number of calibration steps (batches) to run before inference.
     # Each step uses a real observation from the calibration data directory.
     # 0 = no calibration (online scale estimation). Recommended: 32-128.
     calibration_steps: int = 0
+
+    # Random seed for reproducible inference.
+    # - JAX models: used to seed jax.random.key() internally via policy.reset_rng()
+    # - PyTorch models: sets torch.manual_seed() after policy creation
+    # All servers and clients using the same seed will produce identical results.
+    seed: int = 42
 
 
 # Default checkpoints that should be used for each environment.
@@ -106,35 +115,56 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
-            # 1. 先把配置对象取出来
-            #config_data = _config.get_config(args.policy.config)
+            config_data = _config.get_config(args.policy.config)
+            weight_path = os.path.join(args.policy.dir, "model.safetensors")
+            is_pytorch = os.path.exists(weight_path)
             
-            # 2. 打印你想要看的所有信息
-            #print("\n" + "="*20 + " DEBUG INFO " + "="*20)
-            #print(f"【Config Name】: {args.policy.config}")
-            #print(f"【Checkpoint Dir】: {args.policy.dir}")  # <--- 这里就是你要确认的路径！
-            #print(f"【Default Prompt】: {args.default_prompt}")
-            #print(f"【Config Object】: {config_data}")      # 这会打印出具体的 Pi0Config 配置详情
-            #print("="*52 + "\n")
+            print("\n" + "="*52 + " DEBUG INFO " + "="*52)
+            print(f"【Config Name】: {args.policy.config}")
+            print(f"【Checkpoint Dir】: {args.policy.dir}")
+            print(f"【Is PyTorch Model】: {is_pytorch}  {'(model.safetensors found)' if is_pytorch else '(no model.safetensors)'}")
+            print(f"【Quantize】: {args.quantize}")
+            print(f"【Quantize Bits W】: {args.quantize_bits_w}")
+            print(f"【Quantize Bits A】: {args.quantize_bits_a}")
+            print(f"【Quantize Group Size】: {args.quantize_group_size}")
+            print(f"【Calibration Steps】: {args.calibration_steps}")
+            print(f"【Default Prompt】: {args.default_prompt}")
+            print("="*120 + "\n")
 
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config),
                 args.policy.dir,
                 default_prompt=args.default_prompt,
                 quantize=args.quantize,
-                quantize_bits=args.quantize_bits,
+                quantize_bits_w=args.quantize_bits_w,
+                quantize_bits_a=args.quantize_bits_a,
                 quantize_group_size=args.quantize_group_size,
                 calibration_steps=args.calibration_steps,
-            )#get_config(DROID)
+            )
 
         case Default():
             print("="*52 + "\n")
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 
+def _seed_pytorch(seed: int) -> None:
+    """Seed all PyTorch RNG sources for deterministic inference."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Disable benchmark mode for fully deterministic CUDA kernels
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main(args: Args) -> None:
     os.environ["OPENPI_DATA_HOME"] = "/share/chengyuxuan-local/openpi"
     policy = create_policy(args)#创建对应的policy
+
+    # Seed RNGs for reproducibility
+    _seed_pytorch(args.seed)
+    policy.reset_rng(args.seed)
+    logging.info(f"Set random seed to {args.seed} for both PyTorch and JAX RNGs")
+
     policy_metadata = policy.metadata
     set_attention_log_file()
     # Record the policy's behavior.
@@ -157,20 +187,28 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, force=True)
     main(tyro.cli(Args))
 """
+指定cuda_device CUDA_VISIBLE_DEVICES=0 
 # FP16 baseline（和以前一样）
+CUDA_VISIBLE_DEVICES=1   python scripts/serve_policy.py     --port 8001  policy:checkpoint     --policy.config pi05_libero     --policy.dir /share/chengyuxuan-local/openpi/openpi-assets/checkpoints/pi05_libero_pytorch    
+# W4A4 量化（你要跑的）
+CUDA_VISIBLE_DEVICES=0   python scripts/serve_policy.py     --port 8000     --quantize --quantize-bits-w 4 --quantize-bits-a 4 --calibration-steps 64     policy:checkpoint     --policy.config pi05_libero     --policy.dir /share/chengyuxuan-local/openpi/openpi-assets/checkpoints/pi05_libero_pytorch 
+ 
+# W4A8（权重4bit，激活8bit）
 python scripts/serve_policy.py \
     --policy.checkpoint.config pi05_libero \
-    --policy.checkpoint.dir gs://path/to/checkpoint
+    --policy.checkpoint.dir gs://path/to/checkpoint \
+    --quantize \
+    --quantize-bits-w 4 \
+    --quantize-bits-a 8 \
+    --quantize-group-size 256
 
-# W4A4 量化（你要跑的）
-python scripts/serve_policy.py --env LIBERO --port 8000 --quantize --quantize-bits 4  --calibration-steps 64   
-    
 # W8A8（备选，更高精度）
 python scripts/serve_policy.py \
     --policy.checkpoint.config pi05_libero \
     --policy.checkpoint.dir gs://path/to/checkpoint \
     --quantize \
-    --quantize-bits 8 \
+    --quantize-bits-w 8 \
+    --quantize-bits-a 8 \
     --quantize-group-size 256
 
 # W2A2（最低精度，最大压缩）
@@ -178,6 +216,7 @@ python scripts/serve_policy.py \
     --policy.checkpoint.config pi05_libero \
     --policy.checkpoint.dir gs://path/to/checkpoint \
     --quantize \
-    --quantize-bits 2 \
+    --quantize-bits-w 2 \
+    --quantize-bits-a 2 \
     --quantize-group-size 256
     """
