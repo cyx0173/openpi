@@ -149,13 +149,13 @@ class Args:
     mode: int = 5
 
     # ── Recording (Mode 1 / 2) ──────────────────────────────────────────────
-    output_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/dataset/quant_10/quant_w4a4"
-    video_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/dataset/quant_10/videos"
+    output_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/data_new/quant_10/quant_w4a4"
+    video_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/data_new/quant_10/videos"
     task_name: str = ""
     skip_existing: bool = True
 
     # ── Perturbation (Mode 3 / 4) ────────────────────────────────────────────
-    combined_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/dataset/quant_10/combined"
+    combined_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/data_new/quant_10/combined"
     trajectory_list: str = ""
 
 
@@ -465,9 +465,10 @@ def _record_mode5(env, task, task_description, initial_state,
                         "w4a4_actions": current_w4a4,
                         "w4a8_actions": current_w4a8,
                         "w4a16_actions": current_w4a16,
-                        "mujoco_state": mujoco_state,
+                        "mujoco_state": current_chunk_state,
                     })
 
+                current_chunk_state = mujoco_state
                 current_fp16 = []
                 current_w4a4 = []
                 current_w4a8 = []

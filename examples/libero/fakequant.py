@@ -1,45 +1,24 @@
 """
-fakequant.py -- Improved quantization for VLA models (OpenPI).
-
-Key improvements over naive FakeQuant (max + per-channel):
-  1. Per-Group Weight Quantization (group_size=128)
-     - Divides weight matrix into groups of 128 along output-channel dimension
-     - Each group gets its own scale, robust to intra-channel outliers
-  2. Percentile Calibration (default 99.9th percentile)
-     - Replaces max(abs) which is dominated by outliers
-     - Much more stable scale estimation
-  3. Asymmetric Weight Quantization with Zero-Point
-     - Uses zero-point offset so zero lands exactly on a quantized grid point
-     - Better for weights with non-zero-mean distributions
-  4. Per-Token Activation Quantization with Zero-Point
-     - Each token row gets its own scale + zero-point
-     - Handles non-zero-mean activations per token
-  5. Smooth-Step STE (Straight-Through Estimator)
-     - Uses floor + stochastic rounding for less biased quantization
-  6. Optional Per-Group Activation Quantization
-     - Even finer granularity for activations if needed
+Fake-quantization wrapper for VLA models (OpenPI).
 
 Usage:
-    from fakequant import apply_fake_quant, FakeQuantLinear, calibrate_model, CalibrationRunner
+    from fakequant import apply_fake_quant, FakeQuantLinear, CalibrationRunner
 
-    # Option A: Apply with default settings (online scale computation per forward pass)
-    apply_fake_quant(model, bits=4, group_size=128, percentile=99.9)
+    apply_fake_quant(model, bits_w=4, bits_a=4, group_size=256)
 
-    # Option B: Explicit calibration then apply
-    calibrate_model(model, calibration_data, bits=4)
-    apply_fake_quant(model, bits=4, group_size=128)
-
-    # Option C: Online collection + persistence (avoids repeated sorting per forward pass)
     runner = CalibrationRunner(model)
-    runner.start_online_collection(model)         # start silently collecting
-    for batch in data:                            # normal forward passes
-        model(batch)
-    runner.finish_online_collection()            # bake into _x_scales/_x_zero_pts
-    runner.save_calibration("./calib/")           # persist to disk
-    # Next run — load instead of recomputing:
-    runner.load_calibration("./calib/")          # reuse cached scales
+    runner.start()
+    for batch in calibration_data:
+        runner.run_batch(batch)
+    runner.finish()
+    runner.save_calibration("./calib/")
 
-    # Remove quantization
+    runner = CalibrationRunner(model)
+    runner.load_calibration("./calib/")
+
+    layer.set_w_bits(4)
+    layer.set_a_bits(8)
+
     remove_fake_quant(model)
 """
 
@@ -48,200 +27,146 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Literal, Optional, Sequence, Union
+from pathlib import Path
+from typing import Optional, Sequence
 
 
-# --------------------------------------------------------------------------
-# Global DyQVLA-style Dynamic Bit Registry
-# All FakeQuantLinear layers register themselves here for unified bit control.
-# --------------------------------------------------------------------------
+# ── Supported bit-widths (defined before FakeQuantLinear so helpers can use it) ──
 
-_DYQVLA_REGISTRY: dict[int, "FakeQuantLinear"] = {}
-_current_bits: int = 4  # default: W4
-_per_layer_bits_override: dict[int, int] = {}  # layer_id -> bits, for per-layer control
+SUPPORTED_BITS_GLOBAL = (2, 4, 8, 16)
 
 
-def set_global_bits(bits: int) -> None:
-    """Set the global bit-width for all registered FakeQuantLinear layers."""
-    global _current_bits
-    _current_bits = bits
-    # No-op: layers read _current_bits on-the-fly during forward
+# ── Global bit-width state ──────────────────────────────────────────────────────
+
+_current_w_bits: int = 4
+_current_a_bits: int = 4
+_per_layer_w_bits_override: dict[int, int] = {}
+_per_layer_a_bits_override: dict[int, int] = {}
 
 
-def get_all_fakequant_layers(model: nn.Module) -> list["FakeQuantLinear"]:
-    """Recursively collect all FakeQuantLinear instances from a model."""
-    result = []
-    for m in model.modules():
-        if isinstance(m, FakeQuantLinear):
-            result.append(m)
-    return result
+def _validate_bits(bits: int) -> None:
+    if bits not in SUPPORTED_BITS_GLOBAL:
+        raise ValueError(f"Unsupported bits {bits}. Supported: {SUPPORTED_BITS_GLOBAL}")
 
 
-def register_all_fakequant_layers(model: nn.Module) -> int:
-    """
-    Recursively register all FakeQuantLinear instances in the model.
-    Each instance gets a unique ID (its position in the flat list).
-    Returns the total count.
-    """
-    global _DYQVLA_REGISTRY
-    _DYQVLA_REGISTRY.clear()
-    layers = get_all_fakequant_layers(model)
-    for idx, layer in enumerate(layers):
-        layer._layer_id = idx
-        _DYQVLA_REGISTRY[idx] = layer
-    return len(layers)
+def set_global_bits(bits: Optional[int] = None, *, w: Optional[int] = None, a: Optional[int] = None) -> None:
+    global _current_w_bits, _current_a_bits
+    if bits is not None:
+        if w is not None or a is not None:
+            raise ValueError("Use either set_global_bits(bits) or set_global_bits(w=..., a=...), not both.")
+        _validate_bits(bits)
+        _current_w_bits = bits
+        _current_a_bits = bits
+        return
+    if w is not None:
+        _validate_bits(w)
+        _current_w_bits = w
+    if a is not None:
+        _validate_bits(a)
+        _current_a_bits = a
 
 
-# --------------------------------------------------------------------------
-# Scale computation utilities
-# --------------------------------------------------------------------------
+def set_global_bits_w(bits: int) -> None:
+    _validate_bits(bits)
+    global _current_w_bits
+    _current_w_bits = bits
 
-def compute_weight_scale_percentile(
-    weight: torch.Tensor,
+
+def set_global_bits_a(bits: int) -> None:
+    _validate_bits(bits)
+    global _current_a_bits
+    _current_a_bits = bits
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────────
+
+def stochastic_round(x: torch.Tensor) -> torch.Tensor:
+    floor_x = torch.floor(x)
+    return floor_x + (torch.rand_like(x - floor_x) < (x - floor_x)).to(dtype=x.dtype)
+
+
+def _flatten_tokens(x: torch.Tensor) -> torch.Tensor:
+    """Flatten batch dims for per-token quantization. 1D input gets fake batch dim."""
+    if x.dim() == 1:
+        return x.reshape(1, -1)
+    return x.flatten(0, -2)
+
+
+def _calc_asym_qparams_from_minmax(
+    x_min_vals: torch.Tensor,
+    x_max_vals: torch.Tensor,
     bits: int,
-    group_size: int = 128,
-    percentile: float = 99.9,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute per-group weight scales and zero-points using percentile calibration.
+    Asymmetric affine quantization params from per-token min/max.
 
-    Weight shape: (out_features, in_features)
-    We split weight along out_features dimension into groups of `group_size`.
-    Groups that are entirely padding (all zeros) get scale=1 to avoid division by zero.
+    All internal computation is performed in float32 for numerical stability.
+    Forces the real quantization range to include 0, handling all cases correctly:
+      - Positive-only row: real range is [0, x_max], zero_point = 0.
+      - Negative-only row: real range is [x_min, 0], zero_point = q_max.
+      - Cross-zero row: normal [x_min, x_max] range.
+      - All-zeros row: scale clamped to 1e-6, zero_point = 0.
+      - Constant positive / constant negative rows preserve the value
+        instead of being clamped to a single quant level.
 
-    Returns:
-        scales:   (num_groups, 1) per-group magnitude scale
-        zero_pts: (num_groups, 1) per-group zero-point offset
+    Returns scales and zero_pts as float32 tensors.
     """
-    out_dim, in_dim = weight.shape
-    num_groups = (out_dim + group_size - 1) // group_size
+    x_min_vals = x_min_vals.float()
+    x_max_vals = x_max_vals.float()
+    q_min = 0
+    q_max = (2 ** bits) - 1
+    q_range = q_max - q_min
 
-    # Compute per-group scale using percentile. For groups that are all-zero
-    # padding, we set scale=1 to avoid division-by-zero.
-    scales = torch.ones(num_groups, 1, device=weight.device, dtype=weight.dtype)
-    zero_pts = torch.zeros(num_groups, 1, device=weight.device, dtype=weight.dtype)
+    zeros = torch.zeros_like(x_min_vals)
+    x_min = torch.minimum(x_min_vals, zeros)
+    x_max = torch.maximum(x_max_vals, zeros)
 
-    levels = (2 ** (bits - 1)) - 1
+    diff = x_max - x_min
+    scales = torch.clamp(diff / q_range, min=1e-6)
 
-    for g in range(num_groups):
-        start = g * group_size
-        end = min(start + group_size, out_dim)
-        w_g = weight[start:end]  # (actual_size, in_dim)
-        actual_size = end - start
-
-        if actual_size == 0:
-            continue
-
-        # Percentile of abs values across all elements in this group
-        abs_w = torch.abs(w_g)  # (actual_size, in_dim)
-        abs_flat = abs_w.flatten()  # (actual_size * in_dim,)
-        if abs_flat.numel() == 0:
-            continue
-
-        pct_idx = int(round(percentile / 100.0 * (abs_flat.numel() - 1)))
-        pct_idx = min(max(pct_idx, 0), abs_flat.numel() - 1)
-        pct_val = abs_flat.view(-1)[pct_idx]  # access sorted-ish value
-
-        if pct_val > 1e-9:
-            scales[g] = pct_val / levels
-        # else: keep scale=1
-
-    return scales, zero_pts
-
-
-def compute_activation_scale_percentile(
-    x: torch.Tensor,
-    bits: int,
-    percentile: float = 99.9,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute per-token (per-row) activation scales and zero-points using percentile.
-
-    x shape: (*, in_features) where the last dim is features.
-    We operate on the last dimension as the feature dimension,
-    and the first dims as the "batch/token" dimension.
-
-    Returns:
-        scales:   (..., 1) per-token scale
-        zero_pts: (..., 1) per-token zero-point offset
-    """
-    # x_flat: (total_tokens, in_features)
-    x_flat = x.flatten(0, -2)  # (N, in_features)
-
-    # Per-token: 99.9th percentile of abs values
-    abs_x, _ = torch.sort(x_flat, dim=1)
-    idx = int(round(percentile / 100.0 * (x_flat.shape[1] - 1)))
-    idx = min(max(idx, 0), x_flat.shape[1] - 1)
-    max_vals = abs_x[:, idx:idx+1]  # (N, 1)
-
-    max_vals = torch.where(max_vals < 1e-9, torch.ones_like(max_vals), max_vals)
-
-    levels = (2 ** (bits - 1)) - 1
-    scales = max_vals / levels  # (N, 1)
-
-    # Zero-point: for activations we use asymmetric so we compute median
-    # as the zero-point location. This shifts the quantization grid.
-    # zero_pt = round(median(x) / scale)
-    # For simplicity and stability, we use a learned-style zero-point = 0
-    # when using symmetric, or compute median for asymmetric.
-    # Here we use asymmetric: compute per-token zero-point
-    median_vals = torch.median(x_flat, dim=1, keepdim=True)[0]  # (N, 1)
-    zero_pts = torch.round(median_vals / scales)  # (N, 1)
-
-    # Clamp zero-point to valid quantized range
-    q_min = -(2 ** (bits - 1))
-    q_max = 2 ** (bits - 1) - 1
+    zero_pts = torch.round(q_min - x_min / scales)
     zero_pts = torch.clamp(zero_pts, q_min, q_max)
 
     return scales, zero_pts
 
 
-def stochastic_round(x: torch.Tensor) -> torch.Tensor:
-    """
-    Stochastic rounding: rounds to nearest integer with probability
-    proportional to the fractional part. Unbiased rounding, reduces
-    systematic quantization error.
-    """
-    floor_x = torch.floor(x)
-    frac = x - floor_x
-    return floor_x + (torch.rand_like(frac) < frac).float()
+def _compute_weight_scale_percentile(
+    weight: torch.Tensor,
+    bits: int,
+    group_size: int,
+    percentile: float,
+) -> torch.Tensor:
+    """Per-group symmetric signed weight scales using percentile clipping (float32)."""
+    weight_f = weight.float()
+    out_dim = weight_f.shape[0]
+    num_groups = (out_dim + group_size - 1) // group_size
+    scales = torch.ones(num_groups, 1, device=weight_f.device, dtype=torch.float32)
+    levels = (2 ** (bits - 1)) - 1
+    for g in range(num_groups):
+        start, end = g * group_size, min((g + 1) * group_size, out_dim)
+        w_g = weight_f[start:end].flatten()
+        if w_g.numel() == 0:
+            continue
+        sorted_abs = torch.sort(torch.abs(w_g))[0]
+        pct_idx = int(round(percentile / 100.0 * (sorted_abs.numel() - 1)))
+        pct_idx = min(max(pct_idx, 0), sorted_abs.numel() - 1)
+        pct_val = sorted_abs[pct_idx]
+        if pct_val > 1e-9:
+            scales[g] = pct_val / levels
+    return scales
 
 
-# --------------------------------------------------------------------------
-# Core FakeQuantLinear module
-# --------------------------------------------------------------------------
+# ── Core wrapper ────────────────────────────────────────────────────────────────
 
 class FakeQuantLinear(nn.Module):
-    """
-    DyQVLA-style improved fake-quantized Linear layer.
-
-    Key features:
-      - Per-group weight quantization (group_size=256 recommended)
-      - Percentile-based scale calibration (99.9th percentile)
-      - Symmetric weight quantization
-      - Per-token activation quantization
-      - **Dynamic bit switching** (W2/W4/W8/W16) at runtime
-
-    The layer pre-computes scales for all bit-widths on init (lazy).
-    Use set_bits(b) or set_global_bits(b) to switch at runtime.
-
-    Args:
-        linear:               Original nn.Linear to wrap
-        group_size:           Weight group size along output-channel dim (default 256)
-        percentile:           Percentile for calibration (default 99.9)
-        quantize_activations: Whether to quantize activations (default True)
-        stochastic_round:     Use stochastic rounding (default False)
-        exclude_bits:         List of bit-widths to skip pre-computing (default [2])
-    """
-
-    # Supported bit-widths for dynamic switching
-    SUPPORTED_BITS = (2, 4, 8, 16)
+    SUPPORTED_BITS = SUPPORTED_BITS_GLOBAL
 
     def __init__(
         self,
         linear: nn.Linear,
         group_size: int = 256,
-        percentile: float = 99.9,
+        percentile_w: float = 99.9,
+        percentile_a: float = 99.9,
         quantize_activations: bool = True,
         stochastic_round: bool = False,
         exclude_bits: Sequence[int] = (2,),
@@ -249,37 +174,38 @@ class FakeQuantLinear(nn.Module):
         super().__init__()
         self._linear = linear
         self._group_size = group_size
-        self._percentile = percentile
+        self._percentile_w = percentile_w
+        self._percentile_a = percentile_a  # currently unused; activation qparams use exact min/max
         self._quantize_activations = quantize_activations
         self._stochastic_round = stochastic_round
+        # forbid 4 from exclude_bits because excluded bits fall back to 4
+        exclude_bits = list(exclude_bits)
+        if 4 in exclude_bits:
+            raise ValueError("exclude_bits must not include 4 because excluded bits fall back to 4.")
+        for b in exclude_bits:
+            if b not in SUPPORTED_BITS_GLOBAL:
+                raise ValueError(f"Invalid bit {b} in exclude_bits. Supported: {SUPPORTED_BITS_GLOBAL}")
         self._exclude_bits = set(exclude_bits)
-        self._layer_id: int = -1  # set by register_all_fakequant_layers()
+        self._layer_id: int = -1
 
-        # Per-bit pre-computed scales: dict[bits -> (num_groups, 1) tensor]
-        self._scales_cache: dict[int, Optional[torch.Tensor]] = {}
-        self._zero_pts_cache: dict[int, Optional[torch.Tensor]] = {}
+        self._w_scales_cache: dict[int, Optional[torch.Tensor]] = {}
         self._num_groups: int = 0
-        self._w_initialized = False
+        self._w_initialized: bool = False
 
-        # Activation stats caches (recomputed per forward)
-        self._x_scales: Optional[torch.Tensor] = None
-        self._x_zero_pts: Optional[torch.Tensor] = None
+        # activation qparams: dict[bits -> (scales, zero_pts)]
+        self._x_qparams_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
-        # ---- Calibration state ----
-        # When _calibrating=True, the layer collects activation stats instead of quantizing
+        # calibration
         self._calibrating: bool = False
-        # Collected activation magnitude buffers (per token across all calibration batches)
-        self._calib_abs_maxes: Optional[list[torch.Tensor]] = None  # list of (N, 1) per batch
-        self._calib_medians: Optional[list[torch.Tensor]] = None    # list of (N, 1) per batch
-        self._calib_num_batches: int = 0
+        self._calib_x_mins: Optional[list[torch.Tensor]] = None
+        self._calib_x_maxs: Optional[list[torch.Tensor]] = None
 
-        # ---- Online stats collection state ----
-        # When _collecting_online_stats=True, the layer silently accumulates stats
-        # during regular forward passes (without explicit calibration mode).
-        # After collection, call finish_online_collection() to bake them into _x_scales/_x_zero_pts.
-        self._collecting_online_stats: bool = False
-        self._online_abs_maxes: Optional[list[torch.Tensor]] = None  # list of (N, 1) per batch
-        self._online_medians: Optional[list[torch.Tensor]] = None   # list of (N, 1) per batch
+        # online collection
+        self._collecting_online: bool = False
+        self._online_x_mins: Optional[list[torch.Tensor]] = None
+        self._online_x_maxs: Optional[list[torch.Tensor]] = None
+
+    # ── properties ──────────────────────────────────────────────────────────────
 
     @property
     def in_features(self) -> int:
@@ -298,642 +224,593 @@ class FakeQuantLinear(nn.Module):
         return self._linear.bias
 
     @property
-    def current_bits(self) -> int:
-        """Current active bit-width for this layer."""
-        return _per_layer_bits_override.get(self._layer_id, _current_bits)
+    def current_w_bits(self) -> int:
+        return _per_layer_w_bits_override.get(self._layer_id, _current_w_bits)
+
+    @property
+    def current_a_bits(self) -> int:
+        return _per_layer_a_bits_override.get(self._layer_id, _current_a_bits)
+
+    @property
+    def effective_w_bits(self) -> int:
+        bits = self.current_w_bits
+        return 4 if bits in self._exclude_bits else bits
+
+    @property
+    def effective_a_bits(self) -> int:
+        bits = self.current_a_bits
+        return 4 if bits in self._exclude_bits else bits
+
+    # ── bit-width control ───────────────────────────────────────────────────────
 
     def set_bits(self, bits: int) -> None:
-        """Set the bit-width for this specific layer only."""
+        self.set_w_bits(bits)
+        self.set_a_bits(bits)
+
+    def set_w_bits(self, bits: int) -> None:
         if bits not in self.SUPPORTED_BITS:
             raise ValueError(f"Unsupported bits {bits}. Supported: {self.SUPPORTED_BITS}")
-        _per_layer_bits_override[self._layer_id] = bits
+        _per_layer_w_bits_override[self._layer_id] = bits
 
-    def _ensure_weight_scales(self):
-        """Pre-compute per-bit scales lazily on first forward pass."""
+    def set_a_bits(self, bits: int) -> None:
+        if bits not in self.SUPPORTED_BITS:
+            raise ValueError(f"Unsupported bits {bits}. Supported: {self.SUPPORTED_BITS}")
+        _per_layer_a_bits_override[self._layer_id] = bits
+
+    # ── weight quantization ─────────────────────────────────────────────────────
+
+    def _ensure_weight_scales(self) -> None:
         if self._w_initialized:
             return
-
         w = self._linear.weight.detach()
-        out_dim, in_dim = w.shape
-        num_groups = (out_dim + self._group_size - 1) // self._group_size
-        self._num_groups = num_groups
-
+        self._num_groups = (w.shape[0] + self._group_size - 1) // self._group_size
         for bits in self.SUPPORTED_BITS:
-            if bits in self._exclude_bits:
-                self._scales_cache[bits] = None
-                self._zero_pts_cache[bits] = None
-                continue
-
-            scales = torch.ones(num_groups, 1, device=w.device, dtype=w.dtype)
-            zero_pts = torch.zeros(num_groups, 1, device=w.device, dtype=w.dtype)
-            levels = (2 ** (bits - 1)) - 1
-
-            for g in range(num_groups):
-                start = g * self._group_size
-                end = min(start + self._group_size, out_dim)
-                w_g = w[start:end]
-                actual = end - start
-                if actual == 0:
-                    continue
-
-                abs_flat = torch.abs(w_g).flatten()
-                if abs_flat.numel() == 0:
-                    continue
-
-                sorted_abs, _ = torch.sort(abs_flat)
-                pct_idx = int(round(self._percentile / 100.0 * (sorted_abs.numel() - 1)))
-                pct_idx = min(max(pct_idx, 0), sorted_abs.numel() - 1)
-                pct_val = sorted_abs[pct_idx]
-
-                if pct_val > 1e-9:
-                    scales[g] = pct_val / levels
-
-            self._scales_cache[bits] = scales.to(w.dtype)
-            self._zero_pts_cache[bits] = zero_pts.to(w.dtype)
-
+            self._w_scales_cache[bits] = (
+                None if bits in self._exclude_bits
+                else _compute_weight_scale_percentile(w, bits, self._group_size, self._percentile_w)
+                # returns float32, stays float32 in cache
+            )
         self._w_initialized = True
 
     def _quantize_weight(self, w: torch.Tensor, bits: int) -> torch.Tensor:
-        """
-        Quantize weight at a specific bit-width using pre-computed scales.
-
-        Args:
-            w:     (out_features, in_features) full-precision weight
-            bits:  bit-width for this quantization pass
-
-        Returns:
-            w_deq: (out_features, in_features) dequantized weight
-        """
         if bits >= 16:
             return w
-
-        if bits in self._exclude_bits:
-            bits = 4  # fallback to W4
-
+        bits = 4 if bits in self._exclude_bits else bits
         self._ensure_weight_scales()
-
-        scales = self._scales_cache[bits]
-        zero_pts = self._zero_pts_cache[bits]
-
+        orig_dtype = w.dtype
+        w_f = w.float()
+        scales = self._w_scales_cache[bits].to(device=w_f.device, dtype=torch.float32)
+        self._w_scales_cache[bits] = scales
         levels = (2 ** (bits - 1)) - 1
-        q_min = -levels
-        q_max = levels
-
-        out_dim, in_dim = w.shape
-        gs = self._group_size
-        ng = self._num_groups
-
+        q_min, q_max = -levels, levels
+        out_dim, in_dim = w_f.shape
+        gs, ng = self._group_size, self._num_groups
         pad_out = ng * gs - out_dim
-        if pad_out > 0:
-            w_padded = F.pad(w, (0, 0, 0, pad_out))
-        else:
-            w_padded = w
+        w_padded = F.pad(w_f, (0, 0, 0, pad_out)) if pad_out else w_f
+        w_groups = (w_padded.view(ng, gs, in_dim) / scales.view(-1, 1, 1))
+        w_q = stochastic_round(w_groups) if self._stochastic_round else torch.round(w_groups)
+        w_deq = (w_q.clamp(q_min, q_max) * scales.view(-1, 1, 1)).view(-1, in_dim)
+        return w_deq[:-pad_out, :].to(dtype=orig_dtype) if pad_out else w_deq.to(dtype=orig_dtype)
 
-        w_groups = w_padded.view(ng, gs, in_dim)
-        s = scales.view(-1, 1, 1)
-        z = zero_pts.view(-1, 1, 1)
-
-        w_centered = w_groups - z
-        w_norm = w_centered / s
-        if self._stochastic_round:
-            w_q = stochastic_round(w_norm)
-        else:
-            w_q = torch.round(w_norm)
-        w_q = torch.clamp(w_q, q_min, q_max)
-
-        w_deq = w_q * s + z
-        w_deq = w_deq.view(-1, in_dim)
-        if pad_out > 0:
-            w_deq = w_deq[:-pad_out, :]
-
-        return w_deq
+    # ── activation quantization ──────────────────────────────────────────────────
 
     def _quantize_activation(self, x: torch.Tensor, bits: int) -> torch.Tensor:
-        """
-        Quantize activations at a specific bit-width.
-
-        If calibration was performed, uses the cached per-token scales/zero-points.
-        Otherwise computes scales on-the-fly (online) using percentile.
-        """
         if not self._quantize_activations or bits >= 16:
             return x
-
-        if bits in self._exclude_bits:
-            bits = 4
-
-        orig_shape = x.shape
-        x_flat = x.flatten(0, -2)
-
-        # ---- Use calibration-cached scales if available ----
-        if self._x_scales is not None:
-            # x_scales shape: (1, 1) — single shared scale per token dim
-            # We need per-token scales: (N, 1) to match x_flat
-            num_tokens = x_flat.shape[0]
-            scales = self._x_scales.to(x_flat.device).expand(num_tokens, -1)
-            zero_pts = self._x_zero_pts.to(x_flat.device).expand(num_tokens, -1)
+        bits = 4 if bits in self._exclude_bits else bits
+        orig_dtype = x.dtype
+        x_f = _flatten_tokens(x).float()
+        q_min, q_max = 0, (2 ** bits) - 1
+        if bits in self._x_qparams_cache:
+            num_tokens = x_f.shape[0]
+            scales, zero_pts = self._x_qparams_cache[bits]
+            scales = scales.to(device=x_f.device, dtype=torch.float32).expand(num_tokens, -1)
+            zero_pts = zero_pts.to(device=x_f.device, dtype=torch.float32).expand(num_tokens, -1)
         else:
-            # Online scale computation (fallback when no calibration was done)
-            abs_x, _ = torch.sort(torch.abs(x_flat), dim=1)
-            idx = int(round(self._percentile / 100.0 * (x_flat.shape[1] - 1)))
-            idx = min(max(idx, 0), x_flat.shape[1] - 1)
-            max_vals = abs_x[:, idx:idx+1]
-            max_vals = torch.where(max_vals < 1e-9, torch.ones_like(max_vals), max_vals)
-
-            levels = (2 ** (bits - 1)) - 1
-            scales = max_vals / levels
-
-            median_vals = torch.median(x_flat, dim=1, keepdim=True)[0]
-            zero_pts = torch.round(median_vals / scales)
-
-            # ---- Silently collect online stats for future reuse ----
-            if self._collecting_online_stats:
-                self._online_abs_maxes.append(max_vals.detach().clone())
-                self._online_medians.append(median_vals.detach().clone())
-
-        q_min = -(2 ** (bits - 1))
-        q_max = 2 ** (bits - 1) - 1
-
-        zero_pts = torch.clamp(zero_pts, q_min, q_max)
-        zero_pts_float = zero_pts * scales
-
-        x_centered = x_flat - zero_pts_float
-        x_norm = x_centered / scales
-        if self._stochastic_round:
-            x_q = stochastic_round(x_norm)
-        else:
-            x_q = torch.round(x_norm)
+            x_mins, _ = x_f.min(dim=1, keepdim=True)
+            x_maxs, _ = x_f.max(dim=1, keepdim=True)
+            if self._collecting_online:
+                self._online_x_mins.append(x_mins.detach().clone())
+                self._online_x_maxs.append(x_maxs.detach().clone())
+            scales, zero_pts = _calc_asym_qparams_from_minmax(x_mins, x_maxs, bits)
+        x_norm = x_f / scales + zero_pts
+        x_q = stochastic_round(x_norm) if self._stochastic_round else torch.round(x_norm)
         x_q = torch.clamp(x_q, q_min, q_max)
-        x_deq = x_q * scales + zero_pts_float
-        return x_deq.reshape(orig_shape)
+        x_deq = (x_q - zero_pts) * scales
+        return x_deq.to(dtype=orig_dtype).reshape(x.shape)
+
+    # ── calibration ─────────────────────────────────────────────────────────────
 
     def start_calibration(self) -> None:
-        """Begin collecting activation statistics for calibration."""
         self._calibrating = True
-        self._calib_abs_maxes = []
-        self._calib_medians = []
-        self._calib_num_batches = 0
+        self._calib_x_mins = []
+        self._calib_x_maxs = []
+        self._x_qparams_cache.clear()
 
-    def calibrate(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Collect activation statistics for calibration. Returns the raw (unquantized) output,
-        so the model's forward pass is unchanged during calibration.
-        """
-        if not self._calibrating:
-            return self.forward(x)
-        # Forward without quantization (pass through the linear layer)
-        return F.linear(x, self._linear.weight, self._linear.bias)
-
-    def finish_calibration(self, percentile: float = 99.9) -> None:
-        """
-        Finalize calibration: compute per-token scales/zero-points from collected stats
-        using the max across all calibration batches (per token).
-        """
-        if not self._calibrating or self._calib_num_batches == 0:
+    def finish_calibration(self) -> None:
+        if not self._calibrating or not self._calib_x_mins or not self._calib_x_maxs:
             self._calibrating = False
+            self._calib_x_mins = None
+            self._calib_x_maxs = None
             return
-
+        self._finalize_qparams(self._calib_x_mins, self._calib_x_maxs)
         self._calibrating = False
+        self._calib_x_mins = None
+        self._calib_x_maxs = None
 
-        # Per-token: take the MAX abs_max across all batches (covers worst-case range)
-        abs_maxes_cat = torch.cat(self._calib_abs_maxes, dim=0)   # (total_tokens, 1)
-        medians_cat = torch.cat(self._calib_medians, dim=0)       # (total_tokens, 1)
-
-        # Per-token: max across calibration batches
-        # Reshape to (num_batches, tokens_per_batch, 1) then max over batch dim
-        # We don't know batch sizes are equal, so take per-sample max and accumulate
-        # Simpler: just take per-batch max, then overall max
-        abs_max_per_token = abs_maxes_cat  # already (total_tokens, 1) — take per-token max across batches later
-        # Actually, since all batches are concatenated, each row is a distinct token.
-        # The max abs for each token across batches is already captured because
-        # every batch's contribution is stored. But since we concatenate, we need
-        # to track per-token. A simpler robust approach: use the per-batch max,
-        # then take element-wise max across batches.
-
-        # Rebuild: (num_batches, tokens_this_batch, 1) -> (num_batches, 1, 1) max -> overall max
-        # Since we lost batch structure in concatenation, use a running max approach:
-        abs_max_per_token, _ = abs_maxes_cat.max(dim=0, keepdim=True)  # max across all stored values
-        median_per_token, _ = medians_cat.max(dim=0, keepdim=True)  # use max median for safety
-
-        abs_max_per_token = abs_max_per_token.squeeze(0)  # (1,) or keepdim for broadcasting
-        median_per_token = median_per_token.squeeze(0)
-
-        self._x_scales = abs_max_per_token.unsqueeze(0) if abs_max_per_token.dim() == 0 else abs_max_per_token
-        self._x_zero_pts = median_per_token.unsqueeze(0) if median_per_token.dim() == 0 else median_per_token
-
-        # Free calibration buffers
-        self._calib_abs_maxes = None
-        self._calib_medians = None
+    # ── online collection ───────────────────────────────────────────────────────
 
     def start_online_collection(self) -> None:
-        """Begin silently collecting activation stats during regular forward passes.
-
-        After collecting enough data, call finish_online_collection() to bake the
-        accumulated stats into _x_scales / _x_zero_pts for reuse across runs.
-        """
-        self._collecting_online_stats = True
-        self._online_abs_maxes = []
-        self._online_medians = []
+        self._collecting_online = True
+        self._online_x_mins = []
+        self._online_x_maxs = []
+        # clear calibration cache so _quantize_activation takes the no-cache path
+        # and actually collects statistics into _online_x_mins/_online_x_maxs
+        self._x_qparams_cache.clear()
 
     def finish_online_collection(self) -> None:
-        """Finalize online collection: aggregate collected stats into _x_scales / _x_zero_pts.
-
-        Subsequent forward passes use the cached scales instead of recomputing
-        per-batch online statistics (no more repeated sorting per forward pass).
-        """
-        if not self._collecting_online_stats or not self._online_abs_maxes:
-            self._collecting_online_stats = False
+        if not self._collecting_online or not self._online_x_mins:
+            self._collecting_online = False
+            self._online_x_mins = None
+            self._online_x_maxs = None
             return
+        self._finalize_qparams(self._online_x_mins, self._online_x_maxs)
+        self._collecting_online = False
+        self._online_x_mins = None
+        self._online_x_maxs = None
 
-        self._collecting_online_stats = False
+    def _finalize_qparams(self, mins_list: list[torch.Tensor], maxs_list: list[torch.Tensor]) -> None:
+        x_mins_cat = torch.cat(mins_list, dim=0)
+        x_maxs_cat = torch.cat(maxs_list, dim=0)
+        x_min_agg, _ = x_mins_cat.min(dim=0, keepdim=True)
+        x_max_agg, _ = x_maxs_cat.max(dim=0, keepdim=True)
+        self._x_qparams_cache.clear()
+        for bits in self.SUPPORTED_BITS:
+            if bits in self._exclude_bits or bits >= 16:
+                continue
+            self._x_qparams_cache[bits] = _calc_asym_qparams_from_minmax(x_min_agg, x_max_agg, bits)
 
-        abs_max_cat = torch.cat(self._online_abs_maxes, dim=0)   # (total_tokens, 1)
-        median_cat = torch.cat(self._online_medians, dim=0)        # (total_tokens, 1)
-
-        abs_max_agg, _ = abs_max_cat.max(dim=0, keepdim=True)
-        median_agg, _ = median_cat.max(dim=0, keepdim=True)
-
-        abs_max_agg = abs_max_agg.squeeze(0)
-        median_agg = median_agg.squeeze(0)
-
-        self._x_scales = abs_max_agg.unsqueeze(0) if abs_max_agg.dim() == 0 else abs_max_agg
-        self._x_zero_pts = median_agg.unsqueeze(0) if median_agg.dim() == 0 else median_agg
-
-        self._online_abs_maxes = None
-        self._online_medians = None
+    # ── persistence ─────────────────────────────────────────────────────────────
 
     def save_calibration(self, path: str | Path) -> None:
-        """Save calibrated activation scales and zero-points to disk.
-
-        Args:
-            path: File path to save the calibration state dict.
-        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-
-        state = {
-            "x_scales": self._x_scales.cpu() if self._x_scales is not None else None,
-            "x_zero_pts": self._x_zero_pts.cpu() if self._x_zero_pts is not None else None,
-            "percentile": self._percentile,
-        }
-        torch.save(state, path)
+        torch.save({
+            "x_qparams_cache": {bits: (s.cpu(), z.cpu()) for bits, (s, z) in self._x_qparams_cache.items()},
+            "percentile_a": self._percentile_a,
+        }, path)
 
     def load_calibration(self, path: str | Path) -> None:
-        """Load pre-computed activation calibration from disk.
-
-        Args:
-            path: File path to load the calibration state dict from.
-        """
         state = torch.load(path, map_location="cpu", weights_only=True)
-        self._x_scales = state["x_scales"]
-        self._x_zero_pts = state["x_zero_pts"]
+        self._x_qparams_cache = {int(bits): (s, z) for bits, (s, z) in state["x_qparams_cache"].items()}
+
+    # ── forward ────────────────────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bits = self.current_bits
-        if bits >= 16:
-            return self._linear(x)
-
-        w_deq = self._quantize_weight(self._linear.weight, bits)
-        x_deq = self._quantize_activation(x, bits)
-
-        # ---- Collect calibration stats ----
         if self._calibrating:
-            # Collect per-token abs_max and median (before quantization)
-            orig_shape = x.shape
-            x_flat = x.flatten(0, -2)
-
-            abs_x, _ = torch.sort(torch.abs(x_flat), dim=1)
-            idx = int(round(self._percentile / 100.0 * (x_flat.shape[1] - 1)))
-            idx = min(max(idx, 0), x_flat.shape[1] - 1)
-            max_vals = abs_x[:, idx:idx+1]
-            max_vals = torch.where(max_vals < 1e-9, torch.ones_like(max_vals), max_vals)
-
-            median_vals = torch.median(x_flat, dim=1, keepdim=True)[0]
-
-            self._calib_abs_maxes.append(max_vals.detach().clone())
-            self._calib_medians.append(median_vals.detach().clone())
-            self._calib_num_batches += 1
-
-        return F.linear(x_deq, w_deq, self._linear.bias)
-        #依然在做标准的 FP16/FP32 浮点数矩阵乘法
+            x_flat = _flatten_tokens(x).float()
+            self._calib_x_mins.append(x_flat.min(dim=1, keepdim=True)[0].detach().clone())
+            self._calib_x_maxs.append(x_flat.max(dim=1, keepdim=True)[0].detach().clone())
+            return F.linear(x, self._linear.weight, self._linear.bias)
+        w_bits, a_bits = self.current_w_bits, self.current_a_bits
+        if w_bits >= 16 and a_bits >= 16:
+            return self._linear(x)
+        return F.linear(
+            self._quantize_activation(x, a_bits),
+            self._quantize_weight(self._linear.weight, w_bits),
+            self._linear.bias,
+        )
 
 
-# --------------------------------------------------------------------------
-# Calibration runner — orchestrates multi-batch calibration across all layers
-# --------------------------------------------------------------------------
+# ── Layer registry ───────────────────────────────────────────────────────────────
+
+def get_all_fakequant_layers(model: nn.Module) -> list[FakeQuantLinear]:
+    return [m for m in model.modules() if isinstance(m, FakeQuantLinear)]
+
+
+def register_all_fakequant_layers(model: nn.Module) -> int:
+    layers = get_all_fakequant_layers(model)
+    # clear stale per-layer overrides so old IDs don't leak into a new model
+    _per_layer_w_bits_override.clear()
+    _per_layer_a_bits_override.clear()
+    for idx, layer in enumerate(layers):
+        layer._layer_id = idx
+    return len(layers)
+
+
+# ── CalibrationRunner ───────────────────────────────────────────────────────────
 
 class CalibrationRunner:
-    """
-    Orchestrates activation calibration for all FakeQuantLinear layers in a model.
-
-    Usage (explicit calibration):
-        runner = CalibrationRunner(model)
-        for batch in calibration_data:
-            runner.run_batch(model, batch)   # forward pass with hooks
-        runner.finish()
-
-    After finish(), all FakeQuantLinear layers use their calibrated scales
-    for activation quantization.
-
-    Usage (online collection + persistence):
-        runner = CalibrationRunner(model)
-        runner.start_online_collection(model)          # start silently collecting
-        for batch in data:                               # normal forward passes
-            model(batch)
-        runner.finish_online_collection()               # bake stats into _x_scales/_x_zero_pts
-        runner.save_calibration("./calib/")              # persist to disk
-
-        # Next run — load instead of recomputing:
-        runner.load_calibration("./calib/")             # reuse cached scales
-    """
-
-    def __init__(self, percentile: float = 99.9):
+    def __init__(self, model: nn.Module, percentile: float = 99.9):
+        self._model = model
         self._percentile = percentile
-        self._layers: list["FakeQuantLinear"] = []
+        self._layers: list[FakeQuantLinear] = []
 
-    def _register(self, model: torch.nn.Module) -> None:
-        """Start calibration mode on all FakeQuantLinear layers."""
-        from fakequant import get_all_fakequant_layers
-        self._layers = get_all_fakequant_layers(model)
+    def _ensure_layers(self) -> None:
+        if not self._layers:
+            self._layers = get_all_fakequant_layers(self._model)
+
+    def start(self) -> None:
+        self._ensure_layers()
         for layer in self._layers:
             layer.start_calibration()
 
-    def run_batch(self, model: torch.nn.Module, inputs) -> None:
-        """Run one calibration forward pass. `inputs` is passed to model(...) directly."""
+    def run_batch(self, inputs) -> None:
         with torch.no_grad():
-            model(inputs)
+            self._model(**inputs) if isinstance(inputs, dict) else (
+                self._model(*inputs) if isinstance(inputs, (tuple, list)) else self._model(inputs)
+            )
 
     def finish(self) -> None:
-        """Finalize calibration for all layers."""
         for layer in self._layers:
-            layer.finish_calibration(percentile=self._percentile)
-        self._layers.clear()
+            layer.finish_calibration()
 
-    # ---- Online collection variants ----
-
-    def start_online_collection(self, model: torch.nn.Module) -> None:
-        """Start silently collecting activation stats during regular forward passes.
-
-        After running enough data through the model, call finish_online_collection()
-        to bake the stats into each layer's _x_scales / _x_zero_pts.
-        """
-        from fakequant import get_all_fakequant_layers
-        self._layers = get_all_fakequant_layers(model)
+    def start_online_collection(self) -> None:
+        self._ensure_layers()
         for layer in self._layers:
             layer.start_online_collection()
 
     def finish_online_collection(self) -> None:
-        """Finalize online collection for all layers."""
         for layer in self._layers:
             layer.finish_online_collection()
-        # NOTE: _layers is NOT cleared here — call save_calibration() before clearing.
 
     def save_calibration(self, path: str | Path) -> None:
-        """Save calibration state (scales + zero-points) for all layers to disk.
-
-        Args:
-            path: Directory path. Each layer saves to <path>/layer_<id>.pt.
-        """
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
+        self._ensure_layers()
         for layer in self._layers:
             layer.save_calibration(path / f"layer_{layer._layer_id}.pt")
 
     def load_calibration(self, path: str | Path) -> None:
-        """Load pre-computed calibration for all layers from disk.
-
-        Args:
-            path: Directory path. Each layer loads from <path>/layer_<id>.pt.
-        """
-        path = Path(path)
+        self._ensure_layers()
         for layer in self._layers:
-            layer.load_calibration(path / f"layer_{layer._layer_id}.pt")
+            layer.load_calibration(Path(path) / f"layer_{layer._layer_id}.pt")
 
 
-# --------------------------------------------------------------------------
-# Model-level application / removal
-# --------------------------------------------------------------------------
+# ── CalibrationHook ─────────────────────────────────────────────────────────────
 
-def _replace_linear_with_fakequant(
-    parent: nn.Module,
-    name: str,
-    linear: nn.Linear,
-    group_size: int,
-    percentile: float,
-    quantize_activations: bool,
-    stochastic_round: bool,
-    exclude_bits: Sequence[int],
-) -> None:
-    """Replace a single nn.Linear with FakeQuantLinear in-place."""
-    fq = FakeQuantLinear(
-        linear,
-        group_size=group_size,
-        percentile=percentile,
-        quantize_activations=quantize_activations,
-        stochastic_round=stochastic_round,
-        exclude_bits=exclude_bits,
-    )
-    setattr(parent, name, fq)
+class CalibrationHook:
+    """
+    Collects raw activations from nn.Linear modules via forward-pre hooks.
 
+    NOTE: Call this BEFORE apply_fake_quant(), because apply_fake_quant replaces
+    nn.Linear with FakeQuantLinear (which does not forward to the original linear's
+    hook). For post-apply collection, use FakeQuantLinear's built-in
+    CalibrationRunner.start() / start_online_collection() instead.
+    """
+    def __init__(self, model: nn.Module):
+        self._model = model
+        self._activations: dict[str, list[torch.Tensor]] = {}
+        self._handles: list = []
+
+    def _make_hook(self, name: str):
+        def hook(module, input):
+            x = input[0].detach()
+            x = x.flatten(0, -2) if x.dim() > 2 else x.detach()
+            self._activations.setdefault(name, []).append(x)
+        return hook
+
+    def __enter__(self):
+        for name, module in self._model.named_modules():
+            if isinstance(module, nn.Linear):
+                self._handles.append(module.register_forward_pre_hook(self._make_hook(name)))
+        return self
+
+    def __exit__(self, *args):
+        for h in self._handles:
+            h.remove()
+
+    def get_activations(self) -> dict[str, torch.Tensor]:
+        return {name: torch.cat(acts, dim=0) for name, acts in self._activations.items()}
+
+
+# ── Model-level apply / remove ──────────────────────────────────────────────────
 
 def apply_fake_quant(
     model: nn.Module,
-    bits: int = 4,
+    bits_w: int = 4,
+    bits_a: int = 4,
     group_size: int = 256,
-    percentile: float = 99.9,
+    percentile_w: float = 99.9,
+    percentile_a: float = 99.9,
     quantize_activations: bool = True,
     stochastic_round: bool = False,
     exclude_names: Optional[list[str]] = None,
     exclude_bits: Optional[Sequence[int]] = None,
 ) -> int:
-    """
-    Recursively replace all nn.Linear layers in `model` with FakeQuantLinear.
-
-    Args:
-        model:                PyTorch nn.Module to quantize in-place
-        bits:                 Default bit-width for all layers (default 4)
-        group_size:           Weight group size (default 256)
-        percentile:           Percentile for scale calibration (default 99.9)
-        quantize_activations: Whether to quantize activations (default True)
-        stochastic_round:     Use stochastic rounding (default False)
-        exclude_names:        List of submodule names to skip
-        exclude_bits:         Bit-widths to skip pre-computing scales for (default [2])
-
-    Returns:
-        Number of FakeQuantLinear layers created.
-    """
+    if isinstance(model, nn.Linear):
+        raise ValueError("apply_fake_quant expects a parent module, not a bare nn.Linear.")
+    _validate_bits(bits_w)
+    _validate_bits(bits_a)
     exclude_names = exclude_names or []
-    exclude_bits = list(exclude_bits) if exclude_bits else [2]
-
+    exclude_bits = [2] if exclude_bits is None else list(exclude_bits)
     count = 0
 
-    def _recursion(module: nn.Module, prefix: str = "") -> None:
+    def replace(module: nn.Module, name: str, linear: nn.Linear) -> None:
         nonlocal count
-        for name, child in list(module.named_children()):
-            full_name = f"{prefix}.{name}" if prefix else name
+        setattr(module, name, FakeQuantLinear(
+            linear,
+            group_size=group_size,
+            percentile_w=percentile_w,
+            percentile_a=percentile_a,
+            quantize_activations=quantize_activations,
+            stochastic_round=stochastic_round,
+            exclude_bits=exclude_bits,
+        ))
+        count += 1
 
-            if any(ex in full_name for ex in exclude_names):
+    def walk(m: nn.Module, prefix: str = "") -> None:
+        for name, child in list(m.named_children()):
+            full = f"{prefix}.{name}" if prefix else name
+            if any(ex in full for ex in exclude_names):
                 continue
-
+            # skip already-wrapped layers to prevent double-wrapping
+            if isinstance(child, FakeQuantLinear):
+                continue
             if isinstance(child, nn.Linear):
-                _replace_linear_with_fakequant(
-                    module,
-                    name,
-                    child,
-                    group_size=group_size,
-                    percentile=percentile,
-                    quantize_activations=quantize_activations,
-                    stochastic_round=stochastic_round,
-                    exclude_bits=exclude_bits,
-                )
-                count += 1
-            elif hasattr(child, "_modules") and len(child._modules) > 0:
-                _recursion(child, full_name)
+                replace(m, name, child)
+            elif child._modules:
+                walk(child, full)
 
-    _recursion(model)
-
-    # Register all layers for global bit control
+    walk(model)
     register_all_fakequant_layers(model)
-    # Set initial global bit
-    set_global_bits(bits)
-
+    set_global_bits(w=bits_w, a=bits_a)
     return count
 
 
 def remove_fake_quant(model: nn.Module) -> None:
-    """
-    Restore original nn.Linear layers from FakeQuantLinear wrappers.
-    Call this to get back the full-precision model.
-    """
-    def _recursion(module: nn.Module) -> None:
-        for name, child in list(module.named_children()):
+    def walk(m: nn.Module) -> None:
+        for name, child in list(m.named_children()):
             if isinstance(child, FakeQuantLinear):
-                setattr(module, name, child._linear)
-            elif len(child._modules) > 0:
-                _recursion(child)
-
-    _recursion(model)
-
-
-# --------------------------------------------------------------------------
-# Calibration utilities
-# --------------------------------------------------------------------------
-
-def collect_activations_sequential(
-    model: nn.Module,
-    calibration_inputs: Sequence[torch.Tensor],
-    percentile: float = 99.9,
-) -> dict[str, torch.Tensor]:
-    """
-    Run the model on calibration inputs and collect per-layer activations
-    for percentile-based calibration.
-
-    This is a simplified sequential pass -- it does NOT compute the actual
-    forward pass correctly for models with residual connections. For full
-    calibration accuracy, use TorchHook or the calibration wrapper below.
-
-    Returns:
-        dict mapping layer_path -> activation tensor
-    """
-    activations = {}
-
-    def _hook_fn(name: str):
-        def hook(module, input, output):
-            x = input[0].detach()
-            if x.dim() > 2:
-                x = x.flatten(0, -2)
-            activations[name] = x
-        return hook
-
-    hooks = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            h = module.register_forward_pre_hook(_hook_fn(f"{name}_input"))
-            hooks.append(h)
-
-    with torch.no_grad():
-        for inp in calibration_inputs:
-            if isinstance(inp, (list, tuple)):
-                model(*inp)
-            else:
-                model(inp)
-
-    for h in hooks:
-        h.remove()
-
-    return activations
-
-
-class CalibrationHook:
-    """
-    Context manager that registers hooks on all nn.Linear layers in a model
-    to collect activations for percentile-based calibration.
-
-    Usage:
-        with CalibrationHook(model) as hook:
-            with torch.no_grad():
-                for batch in calib_loader:
-                    model(batch)
-        act_dict = hook.get_activations()
-    """
-
-    def __init__(self, model: nn.Module):
-        self.model = model
-        self.activations: dict[str, list[torch.Tensor]] = {}
-        self.hooks = []
-
-    def _make_hook(self, name: str):
-        def hook(module, input):
-            x = input[0].detach()
-            if x.dim() > 2:
-                x = x.flatten(0, -2)
-            if name not in self.activations:
-                self.activations[name] = []
-            self.activations[name].append(x)
-        return hook
-
-    def __enter__(self):
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Linear):
-                h = module.register_forward_pre_hook(self._make_hook(name))
-                self.hooks.append(h)
-        return self
-
-    def __exit__(self, *args):
-        for h in self.hooks:
-            h.remove()
-        self.hooks = []
-
-    def get_activations(self) -> dict[str, torch.Tensor]:
-        """Concatenate all collected activations per layer."""
-        result = {}
-        for name, acts in self.activations.items():
-            result[name] = torch.cat(acts, dim=0)
-        return result
-
-
-# --------------------------------------------------------------------------
-# Precision toggle (for quick A/B testing)
-# --------------------------------------------------------------------------
-
-def is_fakequant_layer(module: nn.Module) -> bool:
-    """Check if a module is a FakeQuantLinear wrapper."""
-    return isinstance(module, FakeQuantLinear)
-
-
-def count_fakequant_layers(model: nn.Module) -> int:
-    """Count how many FakeQuantLinear layers exist in the model."""
-    return sum(1 for m in model.modules() if isinstance(m, FakeQuantLinear))
+                setattr(m, name, child._linear)
+            elif child._modules:
+                walk(child)
+    walk(model)
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    """Count total and per-module parameter counts."""
     total = sum(p.numel() for p in model.parameters())
-    linear_params = sum(
-        p.numel() for m in model.modules() if isinstance(m, nn.Linear) for p in m.parameters()
-    )
-    fakequant = count_fakequant_layers(model)
-    return {
-        "total": total,
-        "linear_params": linear_params,
-        "fakequant_layers": fakequant,
-    }
+    linear_params = sum(p.numel() for m in model.modules() if isinstance(m, nn.Linear) for p in m.parameters())
+    fakequant_count = sum(1 for m in model.modules() if isinstance(m, FakeQuantLinear))
+    return {"total": total, "linear_params": linear_params, "fakequant_layers": fakequant_count}
+
+
+# ── Tests ──────────────────────────────────────────────────────────────────────
+
+def _test():
+    # ── Helper ──────────────────────────────────────────────────────────────────
+
+    def test_case(name: str, x: torch.Tensor, bits: int, tol: float = 0.15):
+        scales, zps = _calc_asym_qparams_from_minmax(x.min(), x.max(), bits)
+        q_min, q_max = 0, (2 ** bits) - 1
+        x_flat = x.flatten(0, -2)
+        x_norm = x_flat / scales + zps
+        x_q = torch.clamp(torch.round(x_norm), q_min, q_max)
+        x_deq = ((x_q - zps) * scales)
+        ok = torch.allclose(x_flat, x_deq, atol=tol)
+        print(f"{'PASS' if ok else 'FAIL'} | {name} | x={x_flat.tolist()} | deq={x_deq.tolist()} | zp={zps.item():.2f}")
+
+    # ── Float32 activation cases ───────────────────────────────────────────────
+
+    test_case("positive row", torch.tensor([[1.0, 1.5, 2.0]]), 4)
+    test_case("negative row", torch.tensor([[-2.0, -1.5, -1.0]]), 4)
+    test_case("cross-zero row", torch.tensor([[-2.0, -1.0, 0.0, 1.0, 2.0]]), 4)
+    test_case("const positive", torch.tensor([[0.5, 0.5, 0.5]]), 4)
+    test_case("const negative", torch.tensor([[-2.0, -2.0, -2.0]]), 4)
+    test_case("all zeros", torch.tensor([[0.0, 0.0, 0.0]]), 4)
+
+    # ── FP16 activation edge cases ─────────────────────────────────────────────
+
+    print("\n--- FP16 activation ---")
+
+    x_fp16_zeros = torch.zeros(1, 3, dtype=torch.float16)
+    fq = FakeQuantLinear(nn.Linear(3, 3), exclude_bits=[])
+    fq._ensure_weight_scales()
+    out = fq._quantize_activation(x_fp16_zeros, 4)
+    ok = not torch.isnan(out).any() and out.dtype == torch.float16
+    print(f"{'PASS' if ok else 'FAIL'} | fp16 all-zeros no NaN | out={out.flatten().tolist()}")
+
+    x_fp16_tiny = torch.tensor([[1e-7, 1e-7, 1e-7]], dtype=torch.float16)
+    out = fq._quantize_activation(x_fp16_tiny, 4)
+    ok = not torch.isnan(out).any() and out.dtype == torch.float16
+    print(f"{'PASS' if ok else 'FAIL'} | fp16 tiny values no NaN | out={out.flatten().tolist()}")
+
+    x_fp16_pos = torch.tensor([[1.0, 1.5, 2.0]], dtype=torch.float16)
+    out = fq._quantize_activation(x_fp16_pos, 4)
+    vals = out.flatten().tolist()
+    distinct = len(set(vals)) > 1
+    ok = not torch.isnan(out).any() and out.dtype == torch.float16 and distinct
+    print(f"{'PASS' if ok else 'FAIL'} | fp16 positive row no NaN, distinct={distinct} | out={vals}")
+
+    x_fp16_neg = torch.tensor([[-2.0, -1.5, -1.0]], dtype=torch.float16)
+    out = fq._quantize_activation(x_fp16_neg, 4)
+    vals = out.flatten().tolist()
+    distinct = len(set(vals)) > 1
+    ok = not torch.isnan(out).any() and out.dtype == torch.float16 and distinct
+    print(f"{'PASS' if ok else 'FAIL'} | fp16 negative row no NaN, distinct={distinct} | out={vals}")
+
+    # ── FP16 FakeQuantLinear forward ──────────────────────────────────────────
+
+    print("\n--- FP16 forward ---")
+
+    linear_h = nn.Linear(4, 4).half()
+    fq = FakeQuantLinear(linear_h, exclude_bits=[])
+    x_h = torch.zeros(2, 4, dtype=torch.float16)
+    fq._ensure_weight_scales()
+    out = fq.forward(x_h)
+    ok = out.dtype == torch.float16 and not torch.isnan(out).any()
+    print(f"{'PASS' if ok else 'FAIL'} | fp16 forward dtype=fp16, no NaN")
+
+    # ── Bit switching ─────────────────────────────────────────────────────────
+
+    print("\n--- Bit switch ---")
+    linear = nn.Linear(8, 8)
+    fq = FakeQuantLinear(linear, group_size=4, exclude_bits=[])
+    x = torch.randn(2, 8)
+    fq._ensure_weight_scales()
+    out4 = fq.forward(x)
+    fq.set_a_bits(8)
+    out8 = fq.forward(x)
+    ok = out4.shape == out8.shape == x.shape
+    print(f"{'PASS' if ok else 'FAIL'} | bit switch W4A4/W4A8 shape check")
+
+    # ── Double apply ──────────────────────────────────────────────────────────
+
+    print("\n--- Double apply ---")
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    count1 = apply_fake_quant(model, bits_w=4, bits_a=4, exclude_bits=[])
+    count2 = apply_fake_quant(model, bits_w=4, bits_a=4, exclude_bits=[])
+    inner = model[0]
+    ok = isinstance(inner, FakeQuantLinear) and not isinstance(inner._linear, FakeQuantLinear)
+    print(f"{'PASS' if ok else 'FAIL'} | double apply no nesting (counts={count1},{count2})")
+
+    # ── Per-layer override clear ───────────────────────────────────────────────
+
+    print("\n--- Override clear ---")
+    model2 = nn.Sequential(nn.Linear(4, 4))
+    apply_fake_quant(model2, bits_w=4, bits_a=4, exclude_bits=[])
+    layer0 = model2[0]
+    layer0.set_w_bits(8)
+    ok = layer0.current_w_bits == 8
+    print(f"{'PASS' if ok else 'FAIL'} | per-layer override set (w_bits={layer0.current_w_bits})")
+    apply_fake_quant(model2, bits_w=4, bits_a=4, exclude_bits=[])
+    ok2 = model2[0].current_w_bits == 4
+    print(f"{'PASS' if ok2 else 'FAIL'} | per-layer override cleared (w_bits={model2[0].current_w_bits})")
+
+    # ── Global bit validation ─────────────────────────────────────────────────
+
+    print("\n--- Bit validation ---")
+    try:
+        set_global_bits_w(99)
+        print("FAIL | invalid bits_w accepted")
+    except ValueError:
+        print("PASS | invalid bits_w rejected")
+    try:
+        apply_fake_quant(nn.Linear(4, 4), bits_w=99, bits_a=4, exclude_bits=[])
+        print("FAIL | invalid bits_w in apply_fake_quant accepted")
+    except ValueError:
+        print("PASS | invalid bits_w in apply_fake_quant rejected")
+
+    # ── set_global_bits backward compat ───────────────────────────────────────
+
+    print("\n--- set_global_bits compat ---")
+    set_global_bits(4)
+    ok = _current_w_bits == 4 and _current_a_bits == 4
+    print(f"{'PASS' if ok else 'FAIL'} | set_global_bits(4) -> W4A4")
+
+    set_global_bits(w=4, a=8)
+    ok = _current_w_bits == 4 and _current_a_bits == 8
+    print(f"{'PASS' if ok else 'FAIL'} | set_global_bits(w=4, a=8) -> W4A8")
+
+    try:
+        set_global_bits(4, w=4, a=8)
+        print("FAIL | set_global_bits(4, w=..., a=...) accepted")
+    except ValueError:
+        print("PASS | set_global_bits(4, w=..., a=...) rejected")
+
+    # ── exclude_bits cannot contain 4 ─────────────────────────────────────────
+
+    print("\n--- exclude_bits validation ---")
+    try:
+        FakeQuantLinear(nn.Linear(4, 4), exclude_bits=[4])
+        print("FAIL | exclude_bits=[4] accepted")
+    except ValueError:
+        print("PASS | exclude_bits=[4] rejected")
+    try:
+        FakeQuantLinear(nn.Linear(4, 4), exclude_bits=[2, 4])
+        print("FAIL | exclude_bits=[2,4] accepted")
+    except ValueError:
+        print("PASS | exclude_bits=[2,4] rejected")
+    try:
+        FakeQuantLinear(nn.Linear(4, 4), exclude_bits=[99])
+        print("FAIL | exclude_bits=[99] accepted")
+    except ValueError:
+        print("PASS | exclude_bits=[99] rejected")
+
+    # ── exclude_bits=[] works correctly ──────────────────────────────────────
+
+    print("\n--- exclude_bits=[] ---")
+    fq = FakeQuantLinear(nn.Linear(4, 4), exclude_bits=[])
+    x = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    fq._ensure_weight_scales()
+    out = fq._quantize_activation(x, 4)
+    ok = out.dtype == x.dtype and out.shape == x.shape
+    print(f"{'PASS' if ok else 'FAIL'} | exclude_bits=[] forward works | shape={out.shape}")
+
+    # ── 1D input shape preserved ────────────────────────────────────────────
+
+    print("\n--- 1D input ---")
+    linear = nn.Linear(4, 3)
+    fq = FakeQuantLinear(linear, exclude_bits=[])
+    x_1d = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    fq._ensure_weight_scales()
+    out_1d = fq.forward(x_1d)
+    ok = out_1d.shape == torch.Size([3])
+    print(f"{'PASS' if ok else 'FAIL'} | 1D input shape preserved | out={out_1d.shape}")
+
+    # ── online_collection after calibration collects stats ────────────────────
+
+    print("\n--- online_collection after calibration ---")
+    linear = nn.Linear(4, 4)
+    fq = FakeQuantLinear(linear, exclude_bits=[])
+    # first run calibration to populate cache
+    fq.start_calibration()
+    fq.forward(torch.randn(2, 4))
+    fq.finish_calibration()
+    assert len(fq._x_qparams_cache) > 0, "calibration should populate cache"
+    # now start online collection -- it must clear the cache and collect new stats
+    fq.start_online_collection()
+    assert len(fq._x_qparams_cache) == 0, "start_online_collection should clear cache"
+    fq.forward(torch.randn(3, 4))
+    fq.forward(torch.randn(3, 4))
+    fq.finish_online_collection()
+    ok = len(fq._x_qparams_cache) > 0
+    print(f"{'PASS' if ok else 'FAIL'} | online_collection after calibration collected stats | cache_size={len(fq._x_qparams_cache)}")
+
+    # ── apply_fake_quant exclude_bits=[] propagates empty set ─────────────────
+
+    print("\n--- apply_fake_quant exclude_bits=[] ---")
+    model3 = nn.Sequential(nn.Linear(4, 4))
+    apply_fake_quant(model3, bits_w=4, bits_a=4, exclude_bits=[])
+    layer = model3[0]
+    ok = layer._exclude_bits == set()
+    print(f"{'PASS' if ok else 'FAIL'} | apply_fake_quant exclude_bits=[] -> empty set | got={layer._exclude_bits}")
+
+    # ── calibration with 1D input ────────────────────────────────────────────
+
+    print("\n--- calibration 1D input ---")
+    linear4 = nn.Linear(4, 4)
+    fq = FakeQuantLinear(linear4, exclude_bits=[])
+    fq.start_calibration()
+    try:
+        fq.forward(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        fq.finish_calibration()
+        ok = len(fq._x_qparams_cache) > 0
+        print(f"{'PASS' if ok else 'FAIL'} | calibration 1D input no crash, cache populated")
+    except Exception as e:
+        print(f"FAIL | calibration 1D input crashed: {e}")
+
+    # ── effective bits reflect fallback ───────────────────────────────────────
+
+    print("\n--- effective bits fallback ---")
+    fq = FakeQuantLinear(nn.Linear(4, 4), exclude_bits=[2])
+    fq.set_bits(2)  # 2 is excluded, should fall back to 4
+    ok_w = fq.effective_w_bits == 4
+    ok_a = fq.effective_a_bits == 4
+    print(f"{'PASS' if ok_w else 'FAIL'} | effective_w_bits with exclude=[2] and set_bits(2) = {fq.effective_w_bits}")
+    print(f"{'PASS' if ok_a else 'FAIL'} | effective_a_bits with exclude=[2] and set_bits(2) = {fq.effective_a_bits}")
+
+    # ── apply_fake_quant rejects bare nn.Linear ───────────────────────────────
+
+    print("\n--- apply_fake_quant bare Linear rejection ---")
+    try:
+        apply_fake_quant(nn.Linear(4, 4))
+        print("FAIL | bare nn.Linear accepted")
+    except ValueError:
+        print("PASS | bare nn.Linear rejected")
+
+    print("\nAll tests done.")
+
+
+if __name__ == "__main__":
+    _test()

@@ -1,45 +1,7 @@
 """
-active_main.py - Mode 6: Active perturbation data collection for adaptive quantization.
-
-Goal: Collect (observation, required_precision) data pairs to train an
-      Adaptive Quantization Selector that predicts which precision level
-      (w4a4 / w4a8 / w4a16 / fp16) is needed at each step.
-
-Logic per (chunk_k, step_s):
-  1. Restore env to (k, s) state
-  2. Try w4a4_action → if done=True → label = "w4a4"
-     (otherwise restore and try w4a8, then w4a16, then fp16)
-
-Prerequisites:
-  Mode 5 must be run first to produce _combined.json containing
-  fp16_actions, w4a4_actions, w4a8_actions, w4a16_actions, and mujoco_state.
-
-Usage:
-  # Mode 5 - Record all four precisions (run first!)
-  #   Terminal 1 (FP16):   uv run python scripts/serve_policy.py --env LIBERO --port 8001
-  #   Terminal 2 (W4A4):   uv run python scripts/serve_policy.py --env LIBERO --port 8000 --quantize --quantize-bits-w 4 --quantize-bits-a 4
-  #   Terminal 3 (W4A8):   uv run python scripts/serve_policy.py --env LIBERO --port 8002 --quantize --quantize-bits-w 4 --quantize-bits-a 8
-  #   Terminal 4 (W4A16):  uv run python scripts/serve_policy.py --env LIBERO --port 8003 --quantize --quantize-bits-w 4 --quantize-bits-a 16
-  #   This script:
-  uv run python examples/libero/quant_main.py \\
-      --mode 5 --task_suite_name libero_spatial \\
-      --port 8001 --w4a4_port 8000 --w4a8_port 8002 --w4a16_port 8003 \\
-      --output_dir data/libero/videos/quant_all
-
-  # Mode 6 - Active data collection (8 FP16 servers for parallel inference)
-  #   Terminal (FP16 inference, 8 servers):
-  #       uv run python scripts/serve_policy.py --env LIBERO --port 8001
-  #       uv run python scripts/serve_policy.py --env LIBERO --port 8002
-  #       ... (ports 8001-8008)
-  #   Launcher script (parses combined files, splits across 8 workers):
-  #       bash run_active_parallel.sh
-  #
-  #   Or manually for a single worker (worker_id defaults to 0):
-  uv run python examples/active_experiment/active_main.py \\
-      --port 8001 \\
-      --worker_id 0 \\
-      --combined_dir data/libero/videos/quant_all \\
-      --output_dir data/active/spatial_results
+Mode 6: Active perturbation data collection for adaptive quantization.
+Collects (observation, required_precision) pairs to train an Adaptive Quantization Selector
+that predicts which precision level (w4a4/w4a8/w4a16/fp16) is needed at each step.
 """
 import collections
 import dataclasses
@@ -68,7 +30,7 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
 
-# ── PyTorch legacy load hack ──────────────────────────────────────────────────
+# PyTorch legacy load hack
 _original_torch_load = torch.load
 def _safe_legacy_load(*args, **kwargs):
     if "weights_only" not in kwargs:
@@ -76,7 +38,7 @@ def _safe_legacy_load(*args, **kwargs):
     return _original_torch_load(*args, **kwargs)
 torch.load = _safe_legacy_load
 
-# ── robosuite robot name patch ───────────────────────────────────────────────
+# robosuite robot name patch
 from robosuite.models.robots.robot_model import create_robot as _create_robot_orig
 def _safe_create_robot(robot_name, *args, **kwargs):
     try:
@@ -91,35 +53,24 @@ for mod_name, mod in list(sys.modules.items()):
         mod.create_robot = _safe_create_robot
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── Args ─────────────────────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
 @dataclasses.dataclass
 class Args:
     host: str = "0.0.0.0"
-    port: int = 8001                       # FP16 server port for inference
+    port: int = 8001
     task_suite_name: str = "libero_10"
     num_steps_wait: int = 10
     seed: int = 7
     resize_size: int = 224
     replan_steps: int = 5
-    # ── Combined data dir (from Mode 5) ───────────────────────────────────
-    combined_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/dataset/quant_10/quant_w4a4"
-    # ── Output dir for collected dataset ────────────────────────────────────
-    output_dir: str = "/home/chengyuxuan/vla/openpi/examples/active_experiment/dataset"
-    video_dir: str = "/home/chengyuxuan/vla/openpi/examples/active_experiment/dataset/videos"
+    combined_dir: str = "/home/chengyuxuan/vla/openpi/examples/quant_experiment/data/quant/quant_w4a4"
+    output_dir: str = "/home/chengyuxuan/vla/openpi/examples/active_experiment/data"
+    video_dir: str = "/home/chengyuxuan/vla/openpi/examples/active_experiment/data/videos"
     trajectory_list: str = ""
     skip_existing: bool = True
-    # ── Checkpoint settings ─────────────────────────────────────────────────
-    checkpoint_every: int = 100             # Save checkpoint every N data points
-    # ── Worker ID (for parallel runs) ───────────────────────────────────────
-    # Each parallel worker should have a unique ID (e.g. 0-7).
-    # Output files are namespaced as checkpoint_w{worker_id}.jsonl etc.
+    checkpoint_every: int = 100
     worker_id: int = 0
 
 
-# ── Max steps per task suite ──────────────────────────────────────────────────
 _MAX_STEPS = {
     "libero_spatial": 220,
     "libero_object": 280,
@@ -128,10 +79,6 @@ _MAX_STEPS = {
     "libero_90": 400,
 }
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── Custom JSON encoder ────────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -146,22 +93,7 @@ class _NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── Environment helpers ────────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _get_libero_env(task, resolution, seed):
-    """
-    PSEUDOCODE:
-        1. task_description = task.language
-        2. bddl_file = get_libero_path("bddl_files") / task.problem_folder / task.bddl_file
-        3. env_args = {"bddl_file_name": bddl_file,
-                       "camera_heights": resolution,
-                       "camera_widths": resolution}
-        4. env = OffScreenRenderEnv(**env_args)
-        5. env.seed(seed)
-        6. return env, task_description
-    """
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     env_args = {
@@ -175,13 +107,6 @@ def _get_libero_env(task, resolution, seed):
 
 
 def _quat2axisangle(quat):
-    """
-    PSEUDOCODE:
-        1. Clip quat[3] (w) to [-1, 1]
-        2. den = sqrt(1 - w^2)
-        3. if den is close to 0 → return zeros(3)  # no rotation
-        4. else → return (quat[:3] * 2 * acos(w)) / den
-    """
     if quat[3] > 1.0:
         quat[3] = 1.0
     elif quat[3] < -1.0:
@@ -193,18 +118,6 @@ def _quat2axisangle(quat):
 
 
 def _get_obs_element(obs, task_description, resize_size):
-    """
-    PSEUDOCODE:
-        1. img = agentview_image, resize to resize_size x resize_size, uint8
-        2. wrist_img = robot0_eye_in_hand_image, resize similarly
-        3. state = concat([eef_pos(3), axis_angle(3), gripper_qpos(1)])
-        4. return {
-               "observation/image": img,
-               "observation/wrist_image": wrist_img,
-               "observation/state": state,
-               "prompt": task_description,
-           }
-    """
     img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
     wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
     img = image_tools.convert_to_uint8(
@@ -252,57 +165,11 @@ def _save_video(video_dir, traj_name, tag, images, success):
     logging.info(f"    [Video] {out_path}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── State restoration ─────────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _restore_env_to_state(env, initial_state, chunk_states, num_steps_wait,
                            fp16_chunks, chunk_perturb, step_perturb):
     """
-    Restore the environment to exactly the state at (chunk_perturb, step_perturb).
-
-    After this call, the env is AT state (k, s):
-      - k = chunk_perturb, s = step_perturb
-      - s steps from chunk k have been taken
-      - the NEXT action will move to (k, s+1)
-
-    Strategy:
-        1. env.reset(); env.set_init_state(initial_state)
-        2. Try teleportation via set_state(chunk_states[k])
-           → has_restored = True on success
-        3. If teleportation FAILED (has_restored=False), run Dummy Action
-           for num_steps_wait to let physics settle.
-           (This is a fallback for when chunk_states[k] is None or OOB.)
-        4. Replay the first `step_perturb` actions of chunk k
-           (steps 0 through s-1, landing at step s)
-        5. return obs  # env is now at (k, s)
-
-    PSEUDOCODE:
-        1. env.reset(); obs = env.set_init_state(initial_state)
-        2. if chunk_states[k] is available:
-               set_state(teleport to k); has_restored = True
-           else:
-               has_restored = False
-        3. if not has_restored:
-               for _ in range(num_steps_wait):
-                   try: obs, _, done, _ = env.step(DUMMY_ACTION)
-                   except ValueError: done = True
-                   if done: return obs
-        4. for a in fp16_chunks[k][:step_perturb]:
-               env.step(a)
-        5. return obs  # env is now at (k, s)
-
-    ARGS:
-        env             - OffScreenRenderEnv
-        initial_state   - np.ndarray
-        chunk_states    - List[dict], mujoco_state at the START of each chunk
-        num_steps_wait  - int
-        fp16_chunks     - List[List[action]]
-        chunk_perturb   - int, target chunk index k
-        step_perturb    - int, target step index s
-
-    RETURNS:
-        obs - observation at (k, s) state
+    Restore environment to state at (chunk_perturb, step_perturb).
+    Falls back to dummy actions or replay if teleportation fails.
     """
     env.reset()
     obs = env.set_init_state(initial_state)
@@ -348,15 +215,8 @@ def _restore_env_to_state(env, initial_state, chunk_states, num_steps_wait,
     return obs
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── FP16 online recovery ───────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _run_fp16_recovery(env, fp16_client, task_description, args, images=None, max_steps=600):
-    """
-    After injecting a candidate action, let FP16 online inference recover.
-    Optionally captures agentview images if `images` list is provided.
-    """
+    """Let FP16 online inference recover after injecting a candidate action."""
     obs = env.get_observation()
     steps_taken = 0
     done = False
@@ -386,35 +246,20 @@ def _run_fp16_recovery(env, fp16_client, task_description, args, images=None, ma
     return bool(done)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── Core: single-step try ────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _try_single_action(env, action):
     """
-    Advance the environment by one step with the given action.
-    Used for injecting a candidate action after state restoration.
-
-    Returns a 2-tuple (done, step_crash):
-        (True,  False) = task completed normally
-        (False, False) = task not done yet; FP16 recovery CAN be attempted
-        (False, True)  = physics crash (NaN / explosion); FP16 recovery is USELESS
-
-    PSEUDOCODE:
-        1. try: obs, _, done, _ = env.step(action)
-        2. except ValueError: return (False, True)   # crash =不可救
-        3. return (done, False)                      # normal =可抢救
+    Advance environment by one step.
+    Returns (done, step_crash):
+        (True, False)  = task completed
+        (False, False)  = not done; FP16 recovery possible
+        (False, True)   = physics crash; FP16 recovery useless
     """
     try:
         _, _, done, _ = env.step(action)
         return (done, False)
     except ValueError:
-        return (False, True)   # physics exploded — skip FP16 recovery
+        return (False, True)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── Core: active step perturbation ─────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _run_active_step_perturbation(env, initial_state,
                                   fp16_chunks, w4a4_chunks, w4a8_chunks, w4a16_chunks,
@@ -423,11 +268,9 @@ def _run_active_step_perturbation(env, initial_state,
                                   task_description, fp16_client, args,
                                   traj_name="", video_dir=None):
     """
-    For a single (chunk_k, step_s) moment, collect one data point.
-    Candidate hierarchy (try in order, stop at first success):
-      w4a4 → w4a8 → w4a16 → fp16 → failed
-
-    Returns: data_point dict.
+    For a single (chunk_k, step_s) moment, try precision candidates in order:
+    w4a4 -> w4a8 -> w4a16 -> fp16 -> failed
+    Returns data_point dict.
     """
     action_fp16  = fp16_chunks[chunk_perturb][step_perturb]
     action_w4a4  = w4a4_chunks[chunk_perturb][step_perturb]
@@ -437,20 +280,19 @@ def _run_active_step_perturbation(env, initial_state,
     def _diff(a, b):
         return float(np.linalg.norm(np.array(a) - np.array(b)))
 
-    # ── Candidate 1: w4a4 ─────────────────────────────────────────────────────
+    # Try w4a4
     obs_at_k_s = _restore_env_to_state(
         env, initial_state, chunk_states, num_steps_wait,
         fp16_chunks, chunk_perturb, step_perturb
-    )
+    )#恢复状态
     eef_before = _get_eef_pos(env, obs_at_k_s)
     images_w4a4 = [np.ascontiguousarray(obs_at_k_s["agentview_image"][::-1, ::-1])]
-    done, step_crash = _try_single_action(env, action_w4a4)
+    done, step_crash = _try_single_action(env, action_w4a4)#执行 w4a4 action
     if step_crash:
         done_w4a4 = False
-        logging.info(f"  chunk={chunk_perturb} step={step_perturb} w4a4: crash (skip recovery)")
+        logging.info(f"  chunk={chunk_perturb} step={step_perturb} w4a4: crash")
     elif done:
         done_w4a4 = True
-        logging.info(f"  chunk={chunk_perturb} step={step_perturb} w4a4: done=True immediately")
     else:
         done_w4a4 = _run_fp16_recovery(env, fp16_client, task_description, args, images=images_w4a4)
         eef_after = _get_eef_pos(env, env.get_observation())
@@ -466,7 +308,7 @@ def _run_active_step_perturbation(env, initial_state,
             "w4a4", chunk_perturb, step_perturb, task_description
         )
 
-    # ── Candidate 2: w4a8 ─────────────────────────────────────────────────────
+    # Try w4a8
     obs_at_k_s = _restore_env_to_state(
         env, initial_state, chunk_states, num_steps_wait,
         fp16_chunks, chunk_perturb, step_perturb
@@ -476,10 +318,9 @@ def _run_active_step_perturbation(env, initial_state,
     done, step_crash = _try_single_action(env, action_w4a8)
     if step_crash:
         done_w4a8 = False
-        logging.info(f"  chunk={chunk_perturb} step={step_perturb} w4a8: crash (skip recovery)")
+        logging.info(f"  chunk={chunk_perturb} step={step_perturb} w4a8: crash")
     elif done:
         done_w4a8 = True
-        logging.info(f"  chunk={chunk_perturb} step={step_perturb} w4a8: done=True immediately")
     else:
         done_w4a8 = _run_fp16_recovery(env, fp16_client, task_description, args, images=images_w4a8)
         eef_after = _get_eef_pos(env, env.get_observation())
@@ -495,7 +336,7 @@ def _run_active_step_perturbation(env, initial_state,
             "w4a8", chunk_perturb, step_perturb, task_description
         )
 
-    # ── Candidate 3: w4a16 ────────────────────────────────────────────────────
+    # Try w4a16
     obs_at_k_s = _restore_env_to_state(
         env, initial_state, chunk_states, num_steps_wait,
         fp16_chunks, chunk_perturb, step_perturb
@@ -505,10 +346,9 @@ def _run_active_step_perturbation(env, initial_state,
     done, step_crash = _try_single_action(env, action_w4a16)
     if step_crash:
         done_w4a16 = False
-        logging.info(f"  chunk={chunk_perturb} step={step_perturb} w4a16: crash (skip recovery)")
+        logging.info(f"  chunk={chunk_perturb} step={step_perturb} w4a16: crash")
     elif done:
         done_w4a16 = True
-        logging.info(f"  chunk={chunk_perturb} step={step_perturb} w4a16: done=True immediately")
     else:
         done_w4a16 = _run_fp16_recovery(env, fp16_client, task_description, args, images=images_w4a16)
         eef_after = _get_eef_pos(env, env.get_observation())
@@ -524,7 +364,7 @@ def _run_active_step_perturbation(env, initial_state,
             "w4a16", chunk_perturb, step_perturb, task_description
         )
 
-    # ── Candidate 4: fp16 (original action) ──────────────────────────────────
+    # Try fp16
     obs_at_k_s = _restore_env_to_state(
         env, initial_state, chunk_states, num_steps_wait,
         fp16_chunks, chunk_perturb, step_perturb
@@ -534,10 +374,9 @@ def _run_active_step_perturbation(env, initial_state,
     done, step_crash = _try_single_action(env, action_fp16)
     if step_crash:
         done_fp16 = False
-        logging.info(f"  chunk={chunk_perturb} step={step_perturb} fp16: crash (skip recovery)")
+        logging.info(f"  chunk={chunk_perturb} step={step_perturb} fp16: crash")
     elif done:
         done_fp16 = True
-        logging.info(f"  chunk={chunk_perturb} step={step_perturb} fp16: done=True immediately")
     else:
         done_fp16 = _run_fp16_recovery(env, fp16_client, task_description, args, images=images_fp16)
         eef_after = _get_eef_pos(env, env.get_observation())
@@ -552,7 +391,7 @@ def _run_active_step_perturbation(env, initial_state,
             "fp16", chunk_perturb, step_perturb, task_description
         )
 
-    # ── Unrecoverable ─────────────────────────────────────────────────────────
+    # Failed
     logging.info(f"  chunk={chunk_perturb} step={step_perturb} failed: no precision succeeded")
     return _build_data_point(
         obs_at_k_s, action_fp16, action_w4a4, action_w4a8, action_w4a16,
@@ -562,28 +401,7 @@ def _run_active_step_perturbation(env, initial_state,
 
 def _build_data_point(obs, action_fp16, action_w4a4, action_w4a8, action_w4a16,
                        label, chunk_idx, step_idx, task_description):
-    """
-    Package observation + 4 actions + label into a single data point dict.
-
-    ARGS:
-        obs                     - raw env observation dict
-        action_fp16/w4a4/8/16  - list of 7 floats
-        label                   - str: "w4a4" | "w4a8" | "w4a16" | "fp16" | "failed"
-        chunk_idx, step_idx     - int
-        task_description        - str
-
-    RETURNS:
-        dict:
-            {
-                "observation": {...},
-                "gt_action_fp16": [...],
-                "gt_action_w4a4": [...],
-                "gt_action_w4a8": [...],
-                "gt_action_w4a16": [...],
-                "required_precision": label,
-                "meta": {"chunk_idx": int, "step_idx": int, "task_description": str},
-            }
-    """
+    """Package observation + 4 actions + label into a data point dict."""
     obs_element = _get_obs_element(obs, task_description, 224)
     meta = {
         "chunk_idx": chunk_idx,
@@ -602,63 +420,11 @@ def _build_data_point(obs, action_fp16, action_w4a4, action_w4a8, action_w4a16,
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── Main dispatcher ─────────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _run_active_perturbation(args: Args, fp16_client) -> None:
-    """
-    Main loop: iterate over all trajectories and all (chunk, step) moments,
-    collect data points via _run_active_step_perturbation().
-
-    PSEUDOCODE:
-        1. Setup: create output_dir, video_dir, load task_suite
-        2. Collect all _combined.json paths (from combined_dir or trajectory_list)
-        3. all_data = [], all_results = [], checkpoint_counter = 0
-
-        4. for each traj_path in tqdm(combined_paths):
-               a. Load _combined.json
-               b. Extract task_id, task_description, chunks
-               c. Extract fp16_chunks, w4a4_chunks, w4a8_chunks, w4a16_chunks, chunk_states
-               d. initial_state = task_suite.get_task_init_states(task_id)[0]
-               e. task = task_suite.get_task(task_id)
-
-               f. For k in range(num_chunks):
-                      For s in range(len(fp16_chunks[k])):
-                          - env = _get_libero_env(task, RESOLUTION, seed)
-                          - try:
-                              data_point = _run_active_step_perturbation(...)
-                              all_data.append(data_point)
-                              all_results.append({
-                                  "chunk_idx": k,
-                                  "step_idx": s,
-                                  "required_precision": data_point["required_precision"],
-                              })
-                          - finally: env.close()
-
-                          - checkpoint_counter += 1
-                          - if checkpoint_counter % checkpoint_every == 0:
-                              _save_checkpoint(all_data, output_dir)
-
-               g. Save per-trajectory result JSON
-
-        5. Final: _save_dataset(all_data, output_dir)
-                  _save_summary(all_data, output_dir)
-
-    ARGS:
-        args        - Args instance
-        fp16_client - WebsocketClientPolicy (FP16 inference)
-
-    RETURNS:
-        None (writes files to output_dir)
-    """
+    """Main loop: iterate over all trajectories and (chunk, step) moments, collect data points."""
     np.random.seed(args.seed)
     logging.info("Active perturbation data collection (Mode 6)")
-    logging.info(f"  FP16 server: {args.host}:{args.port}")
-    logging.info(f"  Combined dir: {args.combined_dir}")
-    logging.info(f"  Output dir: {args.output_dir}")
 
-    # Step 1: Setup
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
 
@@ -667,7 +433,6 @@ def _run_active_perturbation(args: Args, fp16_client) -> None:
     video_dir = pathlib.Path(args.video_dir)
     video_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 2: Collect trajectory paths
     if args.trajectory_list.strip():
         paths = [pathlib.Path(p.strip()) for p in args.trajectory_list.split(",") if p.strip()]
         combined_paths = [p for p in paths if p.exists()]
@@ -681,19 +446,16 @@ def _run_active_perturbation(args: Args, fp16_client) -> None:
         logging.error("No trajectory files found.")
         return
 
-    # Step 3: Init accumulators
     completed, all_data, checkpoint_entries = _load_checkpoint(output_dir, args.worker_id)
     all_results = []
     checkpoint_new_entries = []
     logging.info(f"  Resuming: {len(all_data)} data points already collected, "
                  f"{len(completed)} (traj,k,s) positions completed")
 
-    # Step 4: Iterate
     for traj_path in tqdm.tqdm(combined_paths):
         traj_name = traj_path.stem.replace("_combined", "")
         out_result_path = output_dir / f"{traj_name}_active.json"
 
-        # Skip if trajectory-level result already exists (all (k,s) processed)
         if out_result_path.exists() and args.skip_existing:
             logging.info(f"  [Skip] {traj_name} already fully processed")
             continue
@@ -724,7 +486,6 @@ def _run_active_perturbation(args: Args, fp16_client) -> None:
             init_qpos = init_qpos.tolist()
         initial_state = np.array(init_qpos)
 
-        # Load traj_results from checkpoint entries for already-completed (k,s) in this trajectory
         traj_results = [
             {
                 "chunk_idx": e["chunk_idx"],
@@ -736,14 +497,13 @@ def _run_active_perturbation(args: Args, fp16_client) -> None:
             if e["traj_name"] == traj_name
         ]
 
-        # One env per trajectory, reused for all (k, s) steps
         env_traj, _ = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
         try:
             for k in range(num_chunks):
                 num_steps = len(fp16_chunks[k])
                 for s in range(num_steps):
                     if (traj_name, k, s) in completed:
-                        continue  # already processed, skip
+                        continue
 
                     data_point = _run_active_step_perturbation(
                         env_traj, initial_state,
@@ -775,7 +535,6 @@ def _run_active_perturbation(args: Args, fp16_client) -> None:
         finally:
             env_traj.close()
 
-        # Per-trajectory results
         with open(out_result_path, "w") as f:
             json.dump({
                 "task_id": task_id,
@@ -784,24 +543,17 @@ def _run_active_perturbation(args: Args, fp16_client) -> None:
                 "results": traj_results,
             }, f, indent=2, cls=_NumpyEncoder)
 
-    # Step 5: Flush remaining checkpoint entries
     if checkpoint_new_entries:
         _save_checkpoint(output_dir, checkpoint_new_entries, args.worker_id)
         logging.info(f"  [Final checkpoint] flushed {len(checkpoint_new_entries)} remaining entries")
 
-    # Step 6: Final save
     _save_dataset(all_data, output_dir, args.worker_id)
     _save_summary(all_data, output_dir, args.worker_id)
     logging.info("Done.")
 
 
 def _load_checkpoint(output_dir, worker_id: int):
-    """
-    Parse checkpoint_w{worker_id}.jsonl and return:
-    - completed: set of (traj_name, chunk_idx, step_idx) tuples
-    - all_data: list of data_point dicts (for final dataset/summary)
-    - entries: list of full checkpoint entries (traj_name, chunk_idx, step_idx, data_point)
-    """
+    """Parse checkpoint_w{worker_id}.jsonl and return completed set, all_data, entries."""
     checkpoint_path = pathlib.Path(output_dir) / f"checkpoint_w{worker_id}.jsonl"
     completed = set()
     all_data = []
@@ -821,10 +573,7 @@ def _load_checkpoint(output_dir, worker_id: int):
 
 
 def _save_checkpoint(output_dir, new_entries, worker_id: int):
-    """
-    new_entries: list of dicts with keys traj_name, chunk_idx, step_idx, data_point.
-    Appends to checkpoint_w{worker_id}.jsonl in append mode so partial data survives crash.
-    """
+    """Append entries to checkpoint_w{worker_id}.jsonl."""
     checkpoint_path = pathlib.Path(output_dir) / f"checkpoint_w{worker_id}.jsonl"
     with open(checkpoint_path, "a") as f:
         for entry in new_entries:
@@ -832,11 +581,7 @@ def _save_checkpoint(output_dir, new_entries, worker_id: int):
 
 
 def _save_dataset(all_data, output_dir, worker_id: int):
-    """
-    PSEUDOCODE:
-        1. dataset_path = output_dir / "active_dataset.jsonl"
-        2. Open in write mode, write each data_point as a JSON line
-    """
+    """Save all data points to active_dataset_w{worker_id}.jsonl."""
     dataset_path = pathlib.Path(output_dir) / f"active_dataset_w{worker_id}.jsonl"
     with open(dataset_path, "w") as f:
         for dp in all_data:
@@ -845,13 +590,7 @@ def _save_dataset(all_data, output_dir, worker_id: int):
 
 
 def _save_summary(all_data, output_dir, worker_id: int):
-    """
-    PSEUDOCODE:
-        1. Count label frequencies via Counter
-        2. Compute percentages
-        3. Save summary.json
-        4. Log the counts
-    """
+    """Count label frequencies and save to summary.json."""
     from collections import Counter
     label_counts = Counter(dp["required_precision"] for dp in all_data)
     total = len(all_data)
@@ -872,10 +611,6 @@ def _save_summary(all_data, output_dir, worker_id: int):
     logging.info(f"  Labels: {dict(label_counts)}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── Main entry point ───────────────────────────────────────────────────────────
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def main(args: Args) -> None:
     fp16_client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
     _run_active_perturbation(args, fp16_client)
@@ -884,4 +619,3 @@ def main(args: Args) -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     tyro.cli(main)
-#  pkill -f "active_main.py" 

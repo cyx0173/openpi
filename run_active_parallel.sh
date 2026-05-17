@@ -15,9 +15,9 @@
 set -e
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-COMBINED_DIR="/home/chengyuxuan/vla/openpi/examples/quant_experiment/dataset/quant_10/quant_w4a4"
-OUTPUT_DIR="/home/chengyuxuan/vla/openpi/examples/active_experiment/dataset"
-LOG_DIR="logs/active"
+COMBINED_DIR="/home/chengyuxuan/vla/openpi/examples/quant_experiment/data_new/quant_10/quant_w4a4"
+OUTPUT_DIR="/home/chengyuxuan/vla/openpi/examples/active_experiment/data_new"
+LOG_DIR="logs/active_3"
 PYTHON_SCRIPT="examples/active_experiment/active_main.py"
 
 # ── Parallelism ───────────────────────────────────────────────────────────────
@@ -93,7 +93,6 @@ for ((w = 0; w < NUM_WORKERS; w++)); do
         --args.port "$port" \
         --args.task_suite_name "$TASK_SUITE" \
         --args.combined_dir "$COMBINED_DIR" \
-        --args.output_dir "$OUTPUT_DIR" \
         --args.trajectory_list "${WORKER_FILES[$w]}" \
         --args.worker_id "$w" \
         > "$log_file" 2>&1 &
